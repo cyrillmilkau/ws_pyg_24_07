@@ -311,7 +311,7 @@ def run_inference_procedure(model_path = None, las_file_path = None):
 
     unique_classes, class_counts = np.unique(predicted_classes.cpu().to(torch.uint8).numpy(), return_counts=True)
     print(f"unique classes: {unique_classes}, {class_counts}")
-    save_classified_las(las_file_path, predicted_classes, "new_file.las")
+    save_classified_las(las_file_path, predicted_classes, "/data/new_file.las")
 
 def test_model_on_training_data():
     las_file_path = "/workspace/data/train/a/pc2011_10245101_sub3.las" # "/workspace/data/train/a/pc2011_10245101_sub.las"
@@ -336,7 +336,7 @@ def test_model_on_training_data():
             print(f"unique classes: {unique_classes}, {class_counts}")
             selected_indices = data.idx
             # print(f"Selected indices: {selected_indices}")
-            save_classified_las(las_file_path, predicted_classes, "new_file_test_train.las", selected_indices, B_SAVE_DELECTED)
+            save_classified_las(las_file_path, predicted_classes, "/data/new_file_test_train.las", selected_indices, B_SAVE_DELECTED)
     return # predicted_classes
 
 if __name__ == "__main__":
