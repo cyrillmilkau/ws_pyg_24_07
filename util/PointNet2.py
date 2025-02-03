@@ -1,3 +1,7 @@
+# Copyright (c) 2025 Cyrill Milkau
+# Licensed under the Apache License, Version 2.0
+# See LICENSE file for details.
+
 import torch
 import torch.nn.functional as F
 from torch_geometric.nn import MLP, PointNetConv, global_max_pool, fps, radius, knn_interpolate

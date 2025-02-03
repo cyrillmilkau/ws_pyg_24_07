@@ -1,3 +1,7 @@
+# Copyright (c) 2025 Cyrill Milkau
+# Licensed under the Apache License, Version 2.0
+# See LICENSE file for details.
+
 import torch
 from torch.utils.data import Dataset
 from torch_geometric.data import Data
