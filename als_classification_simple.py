@@ -8,6 +8,7 @@ import glob
 import random 
 import subprocess
 from datetime import datetime
+import time
 
 from torch_geometric.data import DataLoader
 from sklearn.model_selection import train_test_split
@@ -308,8 +309,13 @@ def main():
     data_list = [dataset[i] for i in range(len(dataset))]
 
     # Split
-    train_data, test_data = train_test_split(data_list, test_size=0.2, random_state=42)
-    train_data, val_data = train_test_split(train_data, test_size=0.2, random_state=42)
+    random_seed = int(time.time())
+    print(f"Using random seed: {random_seed}")
+
+    # Random split
+    train_data, test_data = train_test_split(data_list, test_size=0.2, random_state=random_seed)
+    train_data, val_data = train_test_split(train_data, test_size=0.2, random_state=random_seed)
+
     
     labels = np.concatenate([data.y.numpy() for data in train_data])
     unique_labels, counts = np.unique(labels, return_counts=True)
@@ -327,6 +333,11 @@ def main():
     train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=False)
     val_loader = DataLoader(val_data, batch_size=BATCH_SIZE, shuffle=False)
     test_loader = DataLoader(test_data, batch_size=BATCH_SIZE, shuffle=False)
+
+    # Set random seeds for PyTorch
+    torch.manual_seed(random_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(random_seed)
 
     print(f"Train: {len(train_data)}, Val: {len(val_data)}, Test: {len(test_data)}")
 
