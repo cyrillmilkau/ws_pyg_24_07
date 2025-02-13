@@ -199,20 +199,19 @@ class PointNetPlusPlus(torch.nn.Module):
     def __init__(self, num_features, num_target_classes):
         super().__init__()
 
-        # Set Abstraction layers
-        self.sa1_module = SAModule(0.2, 2, MLP([3 + num_features, 64, 64, 128]))
-        self.sa2_module = SAModule(0.25, 8, MLP([128 + 3, 128, 128, 256]))
-        self.sa3_module = GlobalSAModule(MLP([256 + 3, 256, 512, 1024]))
+        # Increased network capacity
+        self.sa1_module = SAModule(0.2, 2, MLP([3 + num_features, 128, 128, 256]))
+        self.sa2_module = SAModule(0.25, 4, MLP([256 + 3, 256, 256, 512]))
+        self.sa3_module = GlobalSAModule(MLP([512 + 3, 512, 512, 1024]))
 
-        # Classification layers
-        self.mlp = MLP([1024, 512, 256, 128, num_target_classes], 
-                      dropout=0.5,
+        # Wider classification layers
+        self.mlp = MLP([1024, 512, 256, num_target_classes], 
+                      dropout=0.3,  # Reduced dropout
                       batch_norm=True)
 
     def forward(self, data):
-        # Prepare input - separate features and positions
-        pos = data.x[:, :3]  # First 3 columns are x,y,z coordinates
-        features = data.x[:, 3:]  # Remaining columns are features (intensity, return_number)
+        pos = data.x[:, :3]
+        features = data.x[:, 3:]
         batch = data.batch if hasattr(data, 'batch') else torch.zeros(pos.size(0), dtype=torch.long, device=pos.device)
 
         # Set abstraction layers
@@ -223,10 +222,9 @@ class PointNetPlusPlus(torch.nn.Module):
         
         x, _, _ = sa3_out
 
-        # Classification - repeat the global features for each point in the original cloud
-        x = x.repeat_interleave(N_POINTS, dim=0)  # Repeat for each point in the original cloud
+        # Repeat features for each point
+        x = x.repeat_interleave(N_POINTS, dim=0)
         
-        # Classification
         return F.log_softmax(self.mlp(x), dim=-1)
 
 def load_model(model_path, in_channels, out_channels, device, model_type='mlp'):
@@ -342,26 +340,20 @@ def main():
         model = PointNetPlusPlus(num_features=2, num_target_classes=TARGET_CLASSES)  # 2 features: intensity, return_number
     
     model = model.to(device)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    
-    # Initialize a zero-filled array for all valid labels
-    class_counts = np.zeros(len(valid_labels), dtype=np.int64)
+    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
 
-    # Fill in the counts for present labels
-    for label, count in zip(unique_labels, counts):
-        if label in label_mapping:  # Only assign if label is in known classes
-            class_counts[label_mapping[label]] = count
-    # print(len(class_counts), class_counts)
-
-    # Calculate class weights
-    total_samples = len(labels)
-    class_weights = torch.zeros(TARGET_CLASSES)
-    for label, count in zip(unique_labels, counts):
-        class_weights[label] = total_samples / (len(unique_labels) * count)
     
-    # Normalize weights
+    # Calculate better class weights
+    total_samples = sum(counts)
+    class_weights = torch.zeros(TARGET_CLASSES, device=device)
+    for label, count in zip(unique_labels, counts):
+        if count > 0:  # Avoid division by zero
+            class_weights[label] = 1.0 / (count / total_samples)
+    
+    # Normalize weights and apply log scaling to reduce extreme values
+    class_weights = torch.log1p(class_weights)
     class_weights = class_weights / class_weights.sum()
-    class_weights = class_weights.to(device)
+    print("Class weights:", class_weights)
     
     criterion = nn.CrossEntropyLoss(weight=class_weights)
 
@@ -465,6 +457,9 @@ def main():
         for epoch in range(EPOCHS):
             train_loss = train()
             val_acc = evaluate(val_loader, epoch)
+            
+            # Update learning rate based on validation accuracy
+            scheduler.step(val_acc)
             
             train_losses.append(train_loss)
             val_accuracies.append(val_acc)
