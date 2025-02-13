@@ -27,10 +27,10 @@ from collections import defaultdict
 
 from torch_geometric.nn import MLP, knn_interpolate, PointNetConv, global_max_pool, fps, radius
 
-N_POINTS = 2**13 # 1024
-EPOCHS = 100
+N_POINTS = 2**12  # 4096 points per chunk
+EPOCHS = 200      # Still enough to learn
+BATCH_SIZE = 8    # Smaller batch size
 TARGET_CLASSES = 14
-BATCH_SIZE = 32
 
 def reset_gpu():
     try:
@@ -53,22 +53,21 @@ class PointCloudChunkedDataset(Dataset):
         self.las_files = las_files
         self.n_points = n_points
         self.n_chunks = 0
-        self.point_chunks = []  # Stores (file_idx, start_idx) for all chunks
+        self.point_chunks = []
         self.label_mapping = label_mapping
 
-        # Precompute chunks for all files
+        # Process files in smaller chunks
         for file_idx, las_file in enumerate(las_files):
             las = laspy.read(las_file)
             total_points = len(las.x)
-            # self.n_chunks = total_points // self.n_points  # Full chunks
-            self.n_chunks = 15
+            # Reduce chunks per file
+            self.n_chunks = 10  # Reduced from 15
             
-            for chunk_idx in range (self.n_chunks):
-                if (chunk_idx * self.n_points) < total_points:
-                    # print(f"chunk_idx * self.n_points: {chunk_idx * self.n_points}")
-                    self.point_chunks.append((file_idx, chunk_idx * self.n_points))
-                else:
-                    break
+            # Add stride to avoid always getting the same points
+            stride = total_points // (self.n_chunks * 2)
+            for chunk_idx in range(self.n_chunks):
+                start_idx = (chunk_idx * stride) % (total_points - n_points)
+                self.point_chunks.append((file_idx, start_idx))
 
         self.pbar = tqdm(total=len(self), desc="Processing Chunks", position=0, leave=True)
 
@@ -200,14 +199,13 @@ class PointNetPlusPlus(torch.nn.Module):
     def __init__(self, num_features, num_target_classes):
         super().__init__()
 
-        # Increased network capacity
-        self.sa1_module = SAModule(0.2, 2, MLP([3 + num_features, 128, 128, 256]))
-        self.sa2_module = SAModule(0.25, 4, MLP([256 + 3, 256, 256, 512]))
-        self.sa3_module = GlobalSAModule(MLP([512 + 3, 512, 512, 1024]))
+        # Reduced network capacity
+        self.sa1_module = SAModule(0.5, 2, MLP([3 + num_features, 64, 64, 128]))  # More aggressive downsampling
+        self.sa2_module = SAModule(0.5, 4, MLP([128 + 3, 128, 128, 256]))
+        self.sa3_module = GlobalSAModule(MLP([256 + 3, 256, 256, 512]))  # Reduced feature dimension
 
-        # Wider classification layers
-        self.mlp = MLP([1024, 512, 256, num_target_classes], 
-                      dropout=0.3,  # Reduced dropout
+        self.mlp = MLP([512, 256, 128, num_target_classes], 
+                      dropout=0.3,
                       batch_norm=True)
 
     def forward(self, data):
@@ -215,7 +213,7 @@ class PointNetPlusPlus(torch.nn.Module):
         features = data.x[:, 3:]
         batch = data.batch if hasattr(data, 'batch') else torch.zeros(pos.size(0), dtype=torch.long, device=pos.device)
 
-        # Set abstraction layers
+        # Process in smaller chunks if needed
         sa0_out = (features, pos, batch)
         sa1_out = self.sa1_module(*sa0_out)
         sa2_out = self.sa2_module(*sa1_out)
@@ -223,8 +221,14 @@ class PointNetPlusPlus(torch.nn.Module):
         
         x, _, _ = sa3_out
 
-        # Repeat features for each point
-        x = x.repeat_interleave(N_POINTS, dim=0)
+        # More memory-efficient repeat
+        chunk_size = 1024
+        repeated_features = []
+        for i in range(0, N_POINTS, chunk_size):
+            end = min(i + chunk_size, N_POINTS)
+            chunk = x.repeat_interleave(end - i, dim=0)
+            repeated_features.append(chunk)
+        x = torch.cat(repeated_features, dim=0)
         
         return F.log_softmax(self.mlp(x), dim=-1)
 
@@ -329,10 +333,13 @@ def main():
     print(f"Min label: {min_label}, {min_mapped}, Max label: {max_label}, {max_mapped}")
     """
 
-    # PyTorch Geometric DataLoader
-    train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=False)
-    val_loader = DataLoader(val_data, batch_size=BATCH_SIZE, shuffle=False)
-    test_loader = DataLoader(test_data, batch_size=BATCH_SIZE, shuffle=False)
+    # Use fewer workers for data loading
+    train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True, 
+                            num_workers=2, pin_memory=True)
+    val_loader = DataLoader(val_data, batch_size=BATCH_SIZE, shuffle=False, 
+                          num_workers=2, pin_memory=True)
+    test_loader = DataLoader(test_data, batch_size=BATCH_SIZE, shuffle=False, 
+                           num_workers=2, pin_memory=True)
 
     # Set random seeds for PyTorch
     torch.manual_seed(random_seed)
@@ -378,44 +385,53 @@ def main():
     print(f"chunk_eff_count: {chunk_eff_count}")
     """
 
-    # def train():
-    #     try:
-    #         model.train()
-    #         total_loss = 0
-    #         progress_bar = tqdm(train_loader, desc="Training", leave=True)
-    #         for data in progress_bar:
-    #             data = data.to(device)
-    #             # print(f"data: {type(data)}")
-    #             optimizer.zero_grad()
-    #             out = model(data)
-    #             loss = criterion(out, data.y)
-    #             loss.backward()
-    #             optimizer.step()
-    #             total_loss += loss.item()
-    #             # progress_bar.set_postfix(loss=loss.item())
-    #         return total_loss / len(train_loader)
-    #     except RuntimeError as e:
-    #         handle_cuda_error(e)  # Handle CUDA error gracefully
+    # Add memory status printing
+    def print_memory_status():
+        if torch.cuda.is_available():
+            print(f"Memory allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+            print(f"Memory cached: {torch.cuda.memory_reserved()/1e9:.2f} GB")
+    
+    # Print memory status periodically
+    print_memory_status()
 
     def train():
         model.train()
         total_loss = 0
-        progress_bar = tqdm(train_loader, desc="Training", leave=False, position=1)  # Inner progress bar
+        progress_bar = tqdm(train_loader, desc="Training", leave=False, position=1)
 
         for data in progress_bar:
+            # Clear cache before each batch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
             data = data.to(device)
             optimizer.zero_grad()
-            out = model(data)
-            loss = criterion(out, data.y)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
+            
+            try:
+                out = model(data)
+                loss = criterion(out, data.y)
+                loss.backward()
+                
+                # Add gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                optimizer.step()
+                total_loss += loss.item()
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    print(f"OOM error, skipping batch")
+                    if hasattr(optimizer, 'zero_grad'):
+                        optimizer.zero_grad()
+                    continue
+                else:
+                    raise e
 
-            progress_bar.set_postfix(loss=loss.item())  # Updates inner progress bar with loss
+            progress_bar.set_postfix(loss=loss.item())
 
-        progress_bar.close()  # Ensure it properly finishes before the outer loop updates
+        progress_bar.close()
         return total_loss / len(train_loader)
-
 
     def evaluate(loader, iter):
         model.eval()
