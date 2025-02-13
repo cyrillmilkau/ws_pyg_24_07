@@ -295,8 +295,8 @@ def main():
     mapped_labels = np.arange(len(valid_labels))
     label_mapping = {old: new for old, new in zip(valid_labels, mapped_labels)}
     label_mapping_inv = {v: k for k, v in label_mapping.items()}
-    print("Label Mapping:", label_mapping)
-    print("Label Mapping inverse:", label_mapping_inv)
+    # print("Label Mapping:", label_mapping)
+    # print("Label Mapping inverse:", label_mapping_inv)
 
     # dataset = PointCloudDataset(las_files, n_points=N_POINTS)
     dataset = PointCloudChunkedDataset(las_files, n_points=N_POINTS, label_mapping=label_mapping)
@@ -309,8 +309,8 @@ def main():
     data_list = [dataset[i] for i in range(len(dataset))]
 
     # Split
-    random_seed = int(time.time())
-    print(f"Using random seed: {random_seed}")
+    random_seed = int(time.time()) # or '42'
+    # print(f"Using random seed: {random_seed}")
 
     # Random split
     train_data, test_data = train_test_split(data_list, test_size=0.2, random_state=random_seed)
@@ -449,7 +449,7 @@ def main():
             
             print("\nConfusion Matrix:")
             classes = sorted(class_total.keys())
-            print("True\Pred", end="\t")
+            print("True\Pred", end="\n")
             for c in classes:
                 print(f"{c}", end="\t")
             print()
