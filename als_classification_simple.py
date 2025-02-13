@@ -22,6 +22,10 @@ import matplotlib.pyplot as plt
 
 from util.ClassificationLabels import ClassificationLabels
 
+from collections import defaultdict
+
+from torch_geometric.nn import MLP, knn_interpolate, PointNetConv, global_max_pool, fps, radius
+
 N_POINTS = 1_000_0
 EPOCHS = 100
 TARGET_CLASSES = 14
@@ -142,50 +146,134 @@ class PointCloudDataset(Dataset):
 class MLPClassifier(nn.Module):
     def __init__(self, in_channels, out_channels):
         super(MLPClassifier, self).__init__()
-        self.fc1 = nn.Linear(in_channels, 128)
-        self.fc2 = nn.Linear(128, 64)
-        self.fc3 = nn.Linear(64, out_channels)
+        self.fc1 = nn.Linear(in_channels, 256)
+        self.bn1 = nn.BatchNorm1d(256)
+        self.fc2 = nn.Linear(256, 128)
+        self.bn2 = nn.BatchNorm1d(128)
+        self.fc3 = nn.Linear(128, 64)
+        self.bn3 = nn.BatchNorm1d(64)
+        self.fc4 = nn.Linear(64, out_channels)
         self.dropout = nn.Dropout(0.3)
 
     def forward(self, data):
-        x = F.relu(self.fc1(data.x))
+        x = F.relu(self.bn1(self.fc1(data.x)))
         x = self.dropout(x)
-        x = F.relu(self.fc2(x))
+        x = F.relu(self.bn2(self.fc2(x)))
         x = self.dropout(x)
-        x = self.fc3(x)
+        x = F.relu(self.bn3(self.fc3(x)))
+        x = self.dropout(x)
+        x = self.fc4(x)
         return F.log_softmax(x, dim=1)
 
-def load_model(model_path, in_channels, out_channels, device):
-    model = MLPClassifier(in_channels, out_channels)
+class SAModule(torch.nn.Module):
+    def __init__(self, ratio, r, nn):
+        super().__init__()
+        self.ratio = ratio
+        self.r = r
+        self.conv = PointNetConv(nn, add_self_loops=False)
+
+    def forward(self, x, pos, batch):
+        idx = fps(pos, batch, ratio=self.ratio)
+        row, col = radius(pos, pos[idx], self.r, batch, batch[idx],
+                          max_num_neighbors=64)
+        edge_index = torch.stack([col, row], dim=0)
+        x_dst = None if x is None else x[idx]
+        x = self.conv((x, x_dst), (pos, pos[idx]), edge_index)
+        pos, batch = pos[idx], batch[idx]
+        return x, pos, batch
+
+class GlobalSAModule(torch.nn.Module):
+    def __init__(self, nn):
+        super().__init__()
+        self.nn = nn
+
+    def forward(self, x, pos, batch):
+        x = self.nn(torch.cat([x, pos], dim=1))
+        x = global_max_pool(x, batch)
+        pos = pos.new_zeros((x.size(0), 3))
+        batch = torch.arange(x.size(0), device=batch.device)
+        return x, pos, batch
+
+class PointNetPlusPlus(torch.nn.Module):
+    def __init__(self, num_features, num_target_classes):
+        super().__init__()
+
+        # Set Abstraction layers
+        self.sa1_module = SAModule(0.2, 2, MLP([3 + num_features, 64, 64, 128]))
+        self.sa2_module = SAModule(0.25, 8, MLP([128 + 3, 128, 128, 256]))
+        self.sa3_module = GlobalSAModule(MLP([256 + 3, 256, 512, 1024]))
+
+        # Classification layers
+        self.mlp = MLP([1024, 512, 256, 128, num_target_classes], 
+                      dropout=0.5,
+                      batch_norm=True)
+
+    def forward(self, data):
+        # Prepare input - separate features and positions
+        pos = data.x[:, :3]  # First 3 columns are x,y,z coordinates
+        features = data.x[:, 3:]  # Remaining columns are features (intensity, return_number)
+        batch = data.batch if hasattr(data, 'batch') else torch.zeros(pos.size(0), dtype=torch.long, device=pos.device)
+
+        # Set abstraction layers
+        sa0_out = (features, pos, batch)
+        sa1_out = self.sa1_module(*sa0_out)
+        sa2_out = self.sa2_module(*sa1_out)
+        sa3_out = self.sa3_module(*sa2_out)
+        
+        x, _, _ = sa3_out
+
+        # Classification
+        return F.log_softmax(self.mlp(x), dim=-1)
+
+def load_model(model_path, in_channels, out_channels, device, model_type='mlp'):
+    if model_type == 'mlp':
+        model = MLPClassifier(in_channels, out_channels)
+    else:  # pointnet++
+        model = PointNetPlusPlus(num_features=2, num_target_classes=out_channels)
+    
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.to(device)
     model.eval()
     return model
 
-def classify_point_cloud(model, las_file, device, n_points=1000):
+def classify_point_cloud(model, las_file, device, n_points=1000, model_type='mlp'):
     las = laspy.read(las_file)
     
     # Extract features
-    xyz = np.column_stack((las.x, las.y, las.z))  # Shape: (num_points, 3)
+    xyz = np.column_stack((las.x, las.y, las.z))
     intensity = np.array(las.intensity, dtype=np.float32)
     return_number = np.array(las.return_number, dtype=np.float32)
-
-    features = np.column_stack((xyz, intensity, return_number))  # Shape: (num_points, 5)
+    features = np.column_stack((xyz, intensity, return_number))
     
-    # Randomly sample points
-    # indices = random.sample(range(len(features)), min(n_points, len(features)))
-    x = torch.tensor(features[0:n_points], dtype=torch.float).to(device)  # Shape: (n_points, 5)
-
-    # Inference
-    with torch.no_grad():
-        out = model(Data(x=x))
-        predicted_labels = out.argmax(dim=1).cpu().numpy()  # Convert to numpy for easy use
-
-    # labels = np.concatenate([data.y.numpy() for data in train_data])
+    # Process in batches to avoid memory issues
+    predictions = []
+    batch_size = 10000
+    
+    for i in range(0, len(features), batch_size):
+        batch = features[i:min(i+batch_size, len(features))]
+        x = torch.tensor(batch, dtype=torch.float).to(device)
+        
+        # Create Data object with batch information for PointNet++
+        if model_type == 'pointnet++':
+            batch_idx = torch.zeros(len(batch), dtype=torch.long, device=device)
+            data = Data(x=x, batch=batch_idx)
+        else:
+            data = Data(x=x)
+        
+        # Inference
+        with torch.no_grad():
+            out = model(data)
+            batch_pred = out.argmax(dim=1).cpu().numpy()
+            predictions.append(batch_pred)
+    
+    predicted_labels = np.concatenate(predictions)
+    
+    # Print detailed statistics
     unique_labels, counts = np.unique(predicted_labels, return_counts=True)
-    print(unique_labels, counts)
-
-    # return indices, predicted_labels
+    for label, count in zip(unique_labels, counts):
+        percentage = (count / len(predicted_labels)) * 100
+        print(f"Class {label}: {count} points ({percentage:.2f}%)")
+    
     return predicted_labels
 
 def save_reclassified_las(las_file, n_points, new_labels, output_file):
@@ -236,8 +324,15 @@ def main():
 
     print(f"Train: {len(train_data)}, Val: {len(val_data)}, Test: {len(test_data)}")
 
-    # Initialize model
-    model = MLPClassifier(in_channels=5, out_channels=TARGET_CLASSES)  # Modify output classes based on dataset
+    # Choose model type ('mlp' or 'pointnet++')
+    model_type = 'pointnet++'  # or 'mlp'
+
+    # Initialize model based on type
+    if model_type == 'mlp':
+        model = MLPClassifier(in_channels=5, out_channels=TARGET_CLASSES)
+    else:  # pointnet++
+        model = PointNetPlusPlus(num_features=2, num_target_classes=TARGET_CLASSES)  # 2 features: intensity, return_number
+    
     model = model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     
@@ -250,12 +345,17 @@ def main():
             class_counts[label_mapping[label]] = count
     # print(len(class_counts), class_counts)
 
-    # weights = 1.0 / (class_counts + 1e-6)  # Avoid division by zero
-    # weights[class_counts == 0] = 0  # Set weights to 0 for missing classes
-    # weights = torch.tensor(weights, dtype=torch.float).to(device)
-    # print(weights)
-    # criterion = nn.CrossEntropyLoss(weight=weights)
-    criterion = nn.CrossEntropyLoss()
+    # Calculate class weights
+    total_samples = len(labels)
+    class_weights = torch.zeros(TARGET_CLASSES)
+    for label, count in zip(unique_labels, counts):
+        class_weights[label] = total_samples / (len(unique_labels) * count)
+    
+    # Normalize weights
+    class_weights = class_weights / class_weights.sum()
+    class_weights = class_weights.to(device)
+    
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
 
     """
     percent = 0.1
@@ -308,18 +408,44 @@ def main():
         model.eval()
         correct = 0
         total = 0
-
-        progress_bar = tqdm(loader, desc="Evaluating", leave=False, position=2)  # Inner progress bar
+        class_correct = defaultdict(int)
+        class_total = defaultdict(int)
+        confusion_matrix = defaultdict(lambda: defaultdict(int))
 
         with torch.no_grad():
-            for data in progress_bar:
+            for data in loader:
                 data = data.to(device)
                 out = model(data)
                 pred = out.argmax(dim=1)
+                
+                # Overall accuracy
                 correct += (pred == data.y).sum().item()
                 total += data.y.size(0)
+                
+                # Per-class accuracy
+                for p, t in zip(pred.cpu().numpy(), data.y.cpu().numpy()):
+                    class_correct[t] += (p == t)
+                    class_total[t] += 1
+                    confusion_matrix[t][p] += 1
 
-        progress_bar.close()  # Close the progress bar after evaluation
+        # Print detailed statistics
+        print("\nPer-class accuracy:")
+        for class_idx in sorted(class_total.keys()):
+            accuracy = class_correct[class_idx] / class_total[class_idx] if class_total[class_idx] > 0 else 0
+            print(f"Class {class_idx}: {accuracy:.4f} ({class_correct[class_idx]}/{class_total[class_idx]})")
+        
+        print("\nConfusion Matrix:")
+        classes = sorted(class_total.keys())
+        print("True\Pred", end="\t")
+        for c in classes:
+            print(f"{c}", end="\t")
+        print()
+        for true_class in classes:
+            print(f"{true_class}", end="\t")
+            for pred_class in classes:
+                print(f"{confusion_matrix[true_class][pred_class]}", end="\t")
+            print()
+
         return correct / total
 
     
@@ -359,7 +485,10 @@ def main():
     print(f"Test Accuracy: {test_acc:.4f}")
 
     # Save the trained model
-    torch.save(model.state_dict(), os.path.join(folder_dir,"mlp_classifier.pth"))
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'model_type': model_type
+    }, os.path.join(folder_dir, f"{model_type}_classifier.pth"))
     print("Model saved successfully!")
 
     """
