@@ -26,9 +26,10 @@ from collections import defaultdict
 
 from torch_geometric.nn import MLP, knn_interpolate, PointNetConv, global_max_pool, fps, radius
 
-N_POINTS = 10000
+N_POINTS = 1024  # Power of 2 is better for GPU processing
 EPOCHS = 100
 TARGET_CLASSES = 14
+BATCH_SIZE = 32  # Increased batch size
 
 def reset_gpu():
     try:
@@ -222,6 +223,9 @@ class PointNetPlusPlus(torch.nn.Module):
         
         x, _, _ = sa3_out
 
+        # Classification - repeat the global features for each point in the original cloud
+        x = x.repeat_interleave(N_POINTS, dim=0)  # Repeat for each point in the original cloud
+        
         # Classification
         return F.log_softmax(self.mlp(x), dim=-1)
 
@@ -322,9 +326,9 @@ def main():
     """
 
     # PyTorch Geometric DataLoader
-    train_loader = DataLoader(train_data, batch_size=8, shuffle=False)
-    val_loader = DataLoader(val_data, batch_size=8, shuffle=False)
-    test_loader = DataLoader(test_data, batch_size=8, shuffle=False)
+    train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=False)
+    val_loader = DataLoader(val_data, batch_size=BATCH_SIZE, shuffle=False)
+    test_loader = DataLoader(test_data, batch_size=BATCH_SIZE, shuffle=False)
 
     print(f"Train: {len(train_data)}, Val: {len(val_data)}, Test: {len(test_data)}")
 
