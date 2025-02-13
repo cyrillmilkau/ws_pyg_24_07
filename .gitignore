@@ -184,3 +184,4 @@ cython_debug/
 /tr3d
 
 /*.las
+/*.png

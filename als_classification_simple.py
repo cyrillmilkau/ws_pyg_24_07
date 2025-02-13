@@ -26,10 +26,10 @@ from collections import defaultdict
 
 from torch_geometric.nn import MLP, knn_interpolate, PointNetConv, global_max_pool, fps, radius
 
-N_POINTS = 1024  # Power of 2 is better for GPU processing
+N_POINTS = 2**13 # 1024
 EPOCHS = 100
 TARGET_CLASSES = 14
-BATCH_SIZE = 32  # Increased batch size
+BATCH_SIZE = 32
 
 def reset_gpu():
     try:
@@ -412,7 +412,7 @@ def main():
         return total_loss / len(train_loader)
 
 
-    def evaluate(loader):
+    def evaluate(loader, iter):
         model.eval()
         correct = 0
         total = 0
@@ -435,24 +435,24 @@ def main():
                     class_correct[t] += (p == t)
                     class_total[t] += 1
                     confusion_matrix[t][p] += 1
-
-        # Print detailed statistics
-        print("\nPer-class accuracy:")
-        for class_idx in sorted(class_total.keys()):
-            accuracy = class_correct[class_idx] / class_total[class_idx] if class_total[class_idx] > 0 else 0
-            print(f"Class {class_idx}: {accuracy:.4f} ({class_correct[class_idx]}/{class_total[class_idx]})")
-        
-        print("\nConfusion Matrix:")
-        classes = sorted(class_total.keys())
-        print("True\Pred", end="\t")
-        for c in classes:
-            print(f"{c}", end="\t")
-        print()
-        for true_class in classes:
-            print(f"{true_class}", end="\t")
-            for pred_class in classes:
-                print(f"{confusion_matrix[true_class][pred_class]}", end="\t")
+        if ( iter == EPOCHS - 1 ):
+            # Print detailed statistics
+            print("\nPer-class accuracy:")
+            for class_idx in sorted(class_total.keys()):
+                accuracy = class_correct[class_idx] / class_total[class_idx] if class_total[class_idx] > 0 else 0
+                print(f"Class {class_idx}: {accuracy:.4f} ({class_correct[class_idx]}/{class_total[class_idx]})")
+            
+            print("\nConfusion Matrix:")
+            classes = sorted(class_total.keys())
+            print("True\Pred", end="\t")
+            for c in classes:
+                print(f"{c}", end="\t")
             print()
+            for true_class in classes:
+                print(f"{true_class}", end="\t")
+                for pred_class in classes:
+                    print(f"{confusion_matrix[true_class][pred_class]}", end="\t")
+                print()
 
         return correct / total
 
@@ -464,7 +464,7 @@ def main():
     with tqdm(total=EPOCHS, desc="Epochs", unit="epoch", position=0) as pbar:
         for epoch in range(EPOCHS):
             train_loss = train()
-            val_acc = evaluate(val_loader)
+            val_acc = evaluate(val_loader, epoch)
             
             train_losses.append(train_loss)
             val_accuracies.append(val_acc)
@@ -476,6 +476,7 @@ def main():
 
             pbar.set_postfix(loss=train_loss, val_acc=val_acc)
             pbar.update(1)
+        pbar.close()
     
     # Plot training loss and validation accuracy
     plt.figure(figsize=(10, 5))
@@ -491,7 +492,7 @@ def main():
     plt.savefig("training_plot.png")  # Save the figure
     # plt.show()
 
-    test_acc = evaluate(test_loader)
+    test_acc = evaluate(test_loader, EPOCHS)
     print(f"Test Accuracy: {test_acc:.4f}")
 
     # Save the trained model
