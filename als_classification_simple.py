@@ -26,7 +26,7 @@ from collections import defaultdict
 
 from torch_geometric.nn import MLP, knn_interpolate, PointNetConv, global_max_pool, fps, radius
 
-N_POINTS = 1_000_0
+N_POINTS = 10000
 EPOCHS = 100
 TARGET_CLASSES = 14
 
@@ -59,7 +59,7 @@ class PointCloudChunkedDataset(Dataset):
             las = laspy.read(las_file)
             total_points = len(las.x)
             # self.n_chunks = total_points // self.n_points  # Full chunks
-            self.n_chunks = 1500
+            self.n_chunks = 15
             
             for chunk_idx in range (self.n_chunks):
                 if (chunk_idx * self.n_points) < total_points:
@@ -298,6 +298,10 @@ def main():
     # dataset = PointCloudDataset(las_files, n_points=N_POINTS)
     dataset = PointCloudChunkedDataset(las_files, n_points=N_POINTS, label_mapping=label_mapping)
 
+    folder_name = datetime.now().strftime("%H-%M") + f"_FILES_{len(las_files)}_POINTS_{N_POINTS}_CHUNKS_{dataset.n_chunks}_EPOCHS_{EPOCHS}"
+    folder_dir = os.path.join("./output/", folder_name)
+    os.makedirs(folder_dir, exist_ok=True)
+
     # Convert dataset to list
     data_list = [dataset[i] for i in range(len(dataset))]
 
@@ -454,20 +458,22 @@ def main():
     val_accuracies = []
 
     with tqdm(total=EPOCHS, desc="Epochs", unit="epoch", position=0) as pbar:
-        for _ in range(EPOCHS):
+        for epoch in range(EPOCHS):
             train_loss = train()
             val_acc = evaluate(val_loader)
             
             train_losses.append(train_loss)
             val_accuracies.append(val_acc)
             
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'model_type': model_type
+            }, os.path.join(folder_dir, f"{model_type}_EPOCH_{epoch}_classifier.pth"))
+
             pbar.set_postfix(loss=train_loss, val_acc=val_acc)
             pbar.update(1)
     
     # Plot training loss and validation accuracy
-    folder_name = datetime.now().strftime("%H-%M") + f"_FILES_{len(las_files)}_POINTS_{N_POINTS}_CHUNKS_{dataset.n_chunks}_EPOCHS_{EPOCHS}"
-    folder_dir = os.path.join("./output/", folder_name)
-    os.makedirs(folder_dir, exist_ok=True)
     plt.figure(figsize=(10, 5))
     plt.plot(range(1, EPOCHS+1), train_losses, label="Train Loss", color="blue")
     plt.plot(range(1, EPOCHS+1), val_accuracies, label="Validation Accuracy", color="red")
