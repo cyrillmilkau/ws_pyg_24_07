@@ -30,9 +30,10 @@ from tqdm import tqdm
 from util.ClassificationLabels import ClassificationLabels
 from util.PointCloudDataset import PointCloudDataset
 from util.PointNet2 import PN2_Classification
+from util.las_util import save_classified_las
 
-MAX_POINTS          =       -1
-MAX_EPOCH           =       10
+MAX_POINTS          =       200
+MAX_EPOCH           =       100
 DEF_LR              =       1e-4
 DEF_WEIGHT          =       1e0
 DEF_FEATURES        =       0
@@ -40,196 +41,17 @@ B_USE_DEF_WEIGHT    =       True
 B_USE_RAND_SEL      =       False    # [related to MAX_POINTS]
 B_SAVE_DELECTED     =       True
 
-# -------------------------------------------------------------------------------------------------------------------------------
-# !!! this is only to be used, if the LAS-file already contains all classes !!!! otherwise use ctor of ClassificationLabels
-"""
-def read_las(pointcloudfile,get_attributes=False,useevery=1):
-    '''
-    :param pointcloudfile: specification of input file (format: las or laz)
-    :param get_attributes: if True, will return all attributes in file, otherwise will only return XYZ (default is False)
-    :param useevery: value specifies every n-th point to use from input, i.e. simple subsampling (default is 1, i.e. returning every point)
-    :return: 3D array of points (x,y,z) of length number of points in input file (or subsampled by 'useevery')
-    '''
-
-    # read the file
-    inFile = laspy.read(pointcloudfile)
-    # get the coordinates (XYZ)
-    coords = np.vstack((inFile.x, inFile.y, inFile.z)).transpose()
-    coords = coords[::useevery, :]
-    if get_attributes == False:
-        return (coords)
-    else:
-        las_fields= [info.name for info in inFile.points.point_format.dimensions]
-        attributes = {}
-        for las_field in las_fields[3:]: # skip the X,Y,Z fields
-            attributes[las_field] = inFile.points[las_field][::useevery]
-        return (coords, attributes)
-
-coords, attrs = read_las("pc2011_10245101_sub.las", get_attributes=True)
-classification_values = attrs["classification"]
-unique_classes, class_counts = np.unique(classification_values, return_counts=True)
-print(f"classification_values: {classification_values}")
-print(f"Unique classes: {unique_classes}")
-print(f"Class counts: {class_counts}")
-total_points = len(classification_values)
-sum_counts = np.sum(class_counts)
-print(f"Total points: {total_points}")
-print(f"Sum of class counts: {sum_counts}")
-print(f"Match: {total_points == sum_counts}")
-"""
-# -------------------------------------------------------------------------------------------------------------------------------
-
-def extract_subset_of_points(inFile, selected_indices):
-    """
-    Helper function to extract a subset of points from a LAS file based on selected indices.
-    
-    :param inFile: The laspy LAS file object
-    :param selected_indices: The indices of the points to extract
-    :return: A tuple (x, y, z, classification)
-    """
-    # Ensure selected indices are numpy arrays for slicing
-    selected_indices = np.array(selected_indices)
-    
-    # Extract the relevant point dimensions
-    x_subset = inFile.x[selected_indices]
-    y_subset = inFile.y[selected_indices]
-    z_subset = inFile.z[selected_indices]
-    classification_subset = inFile.points.classification[selected_indices]
-    
-    return x_subset, y_subset, z_subset, classification_subset
-
-def save_classified_las(original_las_file, predicted_labels, output_file, selected_indices=None, save_only_selected_points=False):
-    '''
-    Adds classification labels to a LAS file and saves a new LAS file with the labels.
-
-    :param original_las_file: path to the input LAS file
-    :param predicted_labels: a numpy array of predicted labels for each point in the point cloud
-    :param output_file: the path to save the new LAS file with the classification labels
-    :param selected_indices: indices of the points to update in the classification field (optional)
-    '''
-
-    # Read the original LAS file
-    inFile = laspy.read(original_las_file)
-
-    # Check if 'classification' is available in the dimensions
-    classification_found = False
-    for dimension in inFile.point_format.dimensions:
-        if dimension.name == 'classification':
-            classification_found = True
-            break
-
-    if not classification_found:
-        print("Error: The LAS file format doesn't support classification.")
-        return
-    
-    if not selected_indices:
-        print("Error: The indices of points receiving the new labels are missing. Find them in PointCloudDataset return values.")
-        return
-
-    # Store the old classification values as the nex classification values before updating the labels
-    new_classification_values = inFile.points.classification.copy()
-    # print(f"new_classification_values: {len(new_classification_values)}")
-
-    # Convert the tensor with new predictions to numpy and then to uint8
-    predicted_labels_np = predicted_labels.cpu().to(torch.uint8).numpy()
-
-    #--------------------------------------------------------------------------------------
-    ## Dummy part --> Test arbitrary classification of classes [1] and [2]
-    # num_points = len(inFile.x)
-    # dummy_labels = np.zeros(num_points, dtype=np.uint8)
-
-    # # Assign label 1 to the first half and label 2 to the second half
-    # half = num_points // 2
-    # dummy_labels[:half] = 1
-    # dummy_labels[half:] = 2
-    #--------------------------------------------------------------------------------------
-    
-    #--------------------------------------------------------------------------------------
-    ## Selected indices part --> Apply new labels to the selected points 
-    if ( False ): # --> This takes very long ...
-        predicted_labels_np = predicted_labels.cpu().numpy()
-        for idx in selected_indices:
-            print(f"idx0: {idx}")
-            print(f"idx1: {selected_indices.tolist().index(idx)}")
-            new_classification_values[idx] = predicted_labels_np[selected_indices.tolist().index(idx)]
-    else: # --> This should do the same, but faster ...
-        selected_indices_np = selected_indices.cpu().numpy()
-        new_classification_values[selected_indices_np] = predicted_labels_np[selected_indices_np]
-
-    #--------------------------------------------------------------------------------------
-
-    # Add the predicted labels to the classification field
-    inFile.points.classification = new_classification_values # Ensure labels are in uint8 format
-    # inFile.points.classification = dummy_labels # Use the dummy labels for classification
-
-    # # if save_only_selected_points:
-    # #     # Extract the subset of points
-    # #     x_subset, y_subset, z_subset, classification_subset = extract_subset_of_points(inFile, selected_indices)
-
-    # #     # Reconstruct the LAS file with the subset
-    # #     new_file = laspy.create(point_format=inFile.point_format)
-    # #     new_file.x = x_subset
-    # #     new_file.y = y_subset
-    # #     new_file.z = z_subset
-    # #     new_file.points.classification = classification_subset
-
-    # #     # Save the updated LAS file
-    # #     new_file.write(output_file)
-    # #     print(f"New classified LAS file saved as: {output_file}")
-    if save_only_selected_points:
-
-        selected_indices = selected_indices.cpu().numpy()
-
-        # Extract all point attributes for the selected points
-        x_subset = inFile.x[selected_indices]
-        y_subset = inFile.y[selected_indices]
-        z_subset = inFile.z[selected_indices]
-        classification_subset = inFile.points.classification[selected_indices]
-        intensity_subset = inFile.intensity[selected_indices]
-        return_number_subset = inFile.return_number[selected_indices]
-        number_of_returns_subset = inFile.number_of_returns[selected_indices]
-        #scan_angle_rank_subset = inFile.scan_angle_rank[selected_indices]
-        #user_data_subset = inFile.user_data[selected_indices]
-        #point_source_ID_subset = inFile.point_source_ID[selected_indices]
-        gps_time_subset = inFile.gps_time[selected_indices]
-
-        # Create a new LAS file with the same point format as the original
-        new_file = laspy.create(point_format=inFile.point_format)
-
-        # Add the selected points with their corresponding attributes to the new file
-        new_file.x = x_subset
-        new_file.y = y_subset
-        new_file.z = z_subset
-        new_file.points.classification = classification_subset
-        new_file.intensity = intensity_subset
-        new_file.return_number = return_number_subset
-        new_file.number_of_returns = number_of_returns_subset
-        #new_file.scan_angle_rank = scan_angle_rank_subset
-        #new_file.user_data = user_data_subset
-        #new_file.point_source_ID = point_source_ID_subset
-        new_file.gps_time = gps_time_subset
-
-        # Save the new LAS file
-        new_file.write(output_file)
-        print(f"New classified LAS-subset file saved as: {output_file}")
-    else:
-        # Save the full LAS file (with updated classification)
-        inFile.write(output_file)
-        print(f"New classified LAS file saved as: {output_file}")
-
-def run_training_procedure(save_model = False):
-
-    las_files = glob.glob("/workspace/data/train/a/*.las")
+def run_training_procedure(las_files, save_model = False):
 
     dataset = PointCloudDataset(las_files, MAX_POINTS, False)# B_USE_RAND_SEL)
-    dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
-
-    # print(f"Dataloader finished")
+    dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
 
     classification = ClassificationLabels('Vorarlberg')
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_target_classes = len(classification.class_labels) # len(unique_classes)
+    
     model = PN2_Classification(num_features=DEF_FEATURES, num_target_classes=num_target_classes).to(device)
+    # print(f"model.parameters(): {len(list(model.parameters()))}")
 
     if (B_USE_DEF_WEIGHT):
         for param in model.parameters():
@@ -240,23 +62,22 @@ def run_training_procedure(save_model = False):
     
     optimizer = torch.optim.Adam(model.parameters(), lr=DEF_LR)
     
-    # print(f"Model finished")
-
     for epoch in range(MAX_EPOCH):  # Increase epochs as needed
         model.train()
         total_loss = 0
         for _, data in enumerate(tqdm(dataloader, desc='>> TRAINING >>')):
 
+            # print(f"data type: {type(data)}")
             data = data.to(device)
             optimizer.zero_grad()
-            out = model(data)
+            out = model(data) # !!!
 
             # print(f"Output shape: {out.shape}")
             # print(f"Target shape: {data.y.shape}")
             # print(f"Min label: {data.y.min()}, Max label: {data.y.max()}, Unique labels: {data.y.unique()}")
 
-            assert all(classification.is_valid_label(label.item()) for label in data.y), \
-                f"Invalid label detected! >>> {data.y[torch.argmax(out)].item()} <<<"
+            # # # assert all(classification.is_valid_label(label.item()) for label in data.y), \
+            # # #     f"Invalid label detected! >>> {data.y[torch.argmax(out)].item()} <<<"
 
             # predicted_labels = out.argmax(dim=1)
             # predicted_class_names = [classification.get_name_from_label(label.item()) for label in predicted_labels]
@@ -356,12 +177,15 @@ def test_model_on_training_data():
 
 if __name__ == "__main__":
 
-    modality = "train" # "test"/"train"/"test_model_on_training_data"
+    # las_files = glob.glob("/workspace/data/general/pc2011/*.las")
+    las_files = glob.glob("/workspace/data/train/a/*.las")
+
+    modality = "inference" # "inference"/"train"/"test_model_on_training_data"
 
     if (modality == "train"):
-        run_training_procedure(False)
-    elif (modality == "test"):
-        run_inference_procedure("./output/models/best.model", "./data/general/lsc_33412_5658_2_sn_sub.las")
+        run_training_procedure(las_files, True)
+    elif (modality == "inference"):
+        run_inference_procedure("./output/models/epoch_100.model", "./data/general/lsc_33412_5658_2_sn.las")
     elif (modality=="test_model_on_training_data"):
         test_model_on_training_data()
     else:

@@ -178,6 +178,9 @@ cython_debug/
 
 # output models
 /output/models
+/output
 
 # tr3d reference
 /tr3d
+
+/*.las

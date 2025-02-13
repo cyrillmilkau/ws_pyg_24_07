@@ -2,11 +2,16 @@
 # Licensed under the Apache License, Version 2.0
 # See LICENSE file for details.
 
+import sys
+sys.path.append(r"/workspace/")
+
 import torch
 from torch.utils.data import Dataset
 from torch_geometric.data import Data
 import laspy
 import numpy as np
+
+from util.las_util import load_las_file
 
 class PointCloudDataset(Dataset):
     def __init__(self, file_list, max_points=4096, use_random=False):
@@ -26,6 +31,12 @@ class PointCloudDataset(Dataset):
     def __getitem__(self, idx):
         file_path = self.file_list[idx]
         points, labels = load_las_file(file_path)
+
+        # # Only keep points labeled as "Building" (assuming class 6 is building)
+        # building_mask = self.labels == 6
+        # self.points = self.points[building_mask]
+        # self.labels = self.labels[building_mask]
+
         return preprocess_point_cloud(points, labels, self.max_points, self.use_random)
     
 def preprocess_point_cloud(points, labels, max_points, use_random):
@@ -46,17 +57,3 @@ def preprocess_point_cloud(points, labels, max_points, use_random):
     idc_t = torch.tensor(indices, dtype=torch.long)
     
     return Data(pos=pos_t, y=lab_t, idx = idc_t)
-
-def load_las_file(las_path):
-    las = laspy.read(las_path)
-    points = np.vstack((las.x, las.y, las.z)).T  # Extract XYZ coordinates
-    labels = las.classification  # Extract classification labels if available
-    return points, labels
-
-"""
-# las_file = "/workspace/train2/pc2011_10245101_sub.las"
-# points, labels = load_las_file(las_file)
-# print(points.shape, labels.shape)
-# data = preprocess_point_cloud(points, labels)
-# print(data)
-"""

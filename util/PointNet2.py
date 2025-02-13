@@ -51,7 +51,8 @@ class FPModule(torch.nn.Module):
 class PN2_Classification(torch.nn.Module):
     def __init__(self, num_features, num_target_classes):
         super().__init__()
-
+        print(f"num_target_classes: {num_target_classes}")
+        print(f"num_features: {num_features}")
         # Input channels account for both pos and node features.
         self.sa1_module = SAModule(0.2, 2, MLP([3 + num_features, 64, 64, 128]))
         self.sa2_module = SAModule(0.25, 8, MLP([128 + 3, 128, 128, 256]))
