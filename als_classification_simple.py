@@ -341,7 +341,9 @@ def main():
     
     model = model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
-
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', 
+                                                   factor=0.5, patience=5, 
+                                                   verbose=True)
     
     # Calculate better class weights
     total_samples = sum(counts)
