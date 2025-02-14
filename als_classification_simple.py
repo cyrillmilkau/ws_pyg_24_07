@@ -79,7 +79,8 @@ class PointCloudChunkedDataset(Dataset):
         for file_idx, las_file in enumerate(las_files):
             las = laspy.read(las_file)
             total_points = len(las.x)
-            self.n_chunks = 15
+            # Reduce chunks per file
+            self.n_chunks = 20 # Reduced from 15
             
             # Add stride to avoid always getting the same points
             stride = total_points // (self.n_chunks * 2)
@@ -261,12 +262,28 @@ def load_model(model_path, in_channels, out_channels, device, model_type='mlp'):
     else:  # pointnet++
         model = PointNetPlusPlus(num_features=2, num_target_classes=out_channels)
     
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    checkpoint = torch.load(model_path, map_location=device)
+
+    # Extract the state_dict from the checkpoint, ignoring other keys like 'model_state_dict' and 'model_type'
+    model_state_dict = checkpoint.get('model_state_dict', checkpoint)  # Default to the checkpoint itself if 'model_state_dict' is not found
+
+    model.load_state_dict(model_state_dict)
+
+    # # Try loading the state_dict into the model
+    # try:
+    #     model.load_state_dict(model_state_dict)
+    # except RuntimeError as e:
+    #     print(f"Error loading state_dict: {e}")
+    #     print("Here are the keys in the saved state_dict:", model_state_dict.keys())
+    #     print("Here are the model's keys:", model.state_dict().keys())
+    #     raise e
+    
     model.to(device)
-    model.eval()
+    model.eval()  # Set the model to evaluation mode
+
     return model
 
-def classify_point_cloud(model, las_file, device, n_points=1000, model_type='mlp'):
+def classify_point_cloud(model, las_file, device, model_type='mlp'):
     las = laspy.read(las_file)
     
     # Extract features
@@ -277,28 +294,38 @@ def classify_point_cloud(model, las_file, device, n_points=1000, model_type='mlp
     
     # Process in batches to avoid memory issues
     predictions = []
-    batch_size = 10000
-    
-    for i in range(0, len(features), batch_size):
-        batch = features[i:min(i+batch_size, len(features))]
+    batch_size = 32768
+    total_points = len(features) # 10_000_000
+    total_predicted = 0
+    # num_batches = len(features) // batch_size + (1 if len(features) % batch_size != 0 else 0)
+    num_batches = (total_points + batch_size - 1) // batch_size 
+
+    for i in tqdm(range(0, len(features), batch_size), total=num_batches, desc="Processing batches", unit="batch"):
+        batch = features[i:min(i + batch_size, len(features))]
         x = torch.tensor(batch, dtype=torch.float).to(device)
+        # print(f"Batch {i // batch_size + 1}, input  shape: {x.shape}")
         
-        # Create Data object with batch information for PointNet++
         if model_type == 'pointnet++':
             batch_idx = torch.zeros(len(batch), dtype=torch.long, device=device)
             data = Data(x=x, batch=batch_idx)
         else:
             data = Data(x=x)
         
-        # Inference
         with torch.no_grad():
             out = model(data)
             batch_pred = out.argmax(dim=1).cpu().numpy()
+            if len(batch) < len(batch_pred):
+                batch_pred = batch_pred[:len(batch)]
             predictions.append(batch_pred)
+            total_predicted += batch_pred.size
+
+            # print(f"Batch {i // batch_size + 1}, output shape: {out.shape}")
     
     predicted_labels = np.concatenate(predictions)
     
-    # Print detailed statistics
+    if total_predicted != total_points:
+        print(f"Warning: Mismatch in the number of predicted labels! Expected {total_points}, got {total_predicted}")
+
     unique_labels, counts = np.unique(predicted_labels, return_counts=True)
     for label, count in zip(unique_labels, counts):
         percentage = (count / len(predicted_labels)) * 100
@@ -308,9 +335,19 @@ def classify_point_cloud(model, las_file, device, n_points=1000, model_type='mlp
 
 def save_reclassified_las(las_file, n_points, new_labels, output_file):
     las = laspy.read(las_file)
-    las.classification[0:n_points] = new_labels  # Update classification
+    las.classification[0:n_points] = new_labels
     las.write(output_file)
     print(f"Updated LAS file saved to: {output_file}")
+
+def main_classify(model_path, las_file_path):
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = load_model(model_path, in_channels=5, out_channels=TARGET_CLASSES, device=device, model_type="pointnet++")
+
+    new_labels = classify_point_cloud(model=model, las_file=las_file_path, device=device, model_type="pointnet++")
+
+    save_reclassified_las(las_file_path, 10_000_000, new_labels, "/workspace/reclassified.las")
+    print(f"Classified {len(new_labels)} points from {las_file_path}")
 
 def main():
     torch.cuda.empty_cache()
@@ -611,4 +648,7 @@ if __name__ == "__main__":
     #     main()
     # except RuntimeError as e:
     #     handle_cuda_error(e)  # Handle error if occurs
-    main()
+    # main()
+    model_path = "/workspace/output/00-29_FILES_16_POINTS_32768_CHUNKS_20_EPOCHS_1000/pointnet++_EPOCH_357_classifier.pth"
+    las_file_path = "/workspace/data/general/pc2011/pc2011_11245000_RANDOM_SUBSAMPLED_2025-02-10_23h17_29_325.las"
+    main_classify(model_path, las_file_path)
