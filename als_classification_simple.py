@@ -92,13 +92,16 @@ class PointCloudChunkedDataset(Dataset):
         return len(self.point_chunks)
 
     def get(self, idx):
-
         file_idx, start_idx = self.point_chunks[idx]
         las = laspy.read(self.las_files[file_idx])
         
         # Extract features --> TODO Option in constructor
         feature_list = []
-        feature_list.append(np.column_stack((las.x, las.y, las.z)))             # xyz
+        xyz = np.column_stack((las.x, las.y, las.z))
+        xyz_min = xyz.min(axis=0)
+        xyz_max = xyz.max(axis=0)
+        xyz_normalized = 2 * (xyz - xyz_min) / (xyz_max - xyz_min) - 1
+        feature_list.append(xyz_normalized)             # xyz
         # feature_list.append(np.array(las.intensity, dtype=np.float32))        # intensity
         # feature_list.append(np.array(las.return_number, dtype=np.float32))    # return_number
         
@@ -232,14 +235,23 @@ class PointNetPlusPlus(torch.nn.Module):
     def __init__(self, num_features, num_target_classes):
         super().__init__()
 
-        # Reduced network capacity
-        self.sa1_module = SAModule(0.5, 2, MLP([3 + num_features, 64, 64, 128]))  # More aggressive downsampling
-        self.sa2_module = SAModule(0.5, 4, MLP([128 + 3, 128, 128, 256]))
-        self.sa3_module = GlobalSAModule(MLP([256 + 3, 256, 256, 512]))  # Reduced feature dimension
+        # Increase initial feature dimensions
+        self.sa1_module = SAModule(0.5, 2, MLP([3 + num_features, 128, 128, 256]))
+        self.sa2_module = SAModule(0.5, 4, MLP([256 + 3, 256, 256, 512]))
+        self.sa3_module = GlobalSAModule(MLP([512 + 3, 512, 512, 1024]))
 
-        self.mlp = MLP([512, 256, 128, num_target_classes], 
-                      dropout=0.3,
-                      batch_norm=True)
+        # Add batch norm and more layers to final MLP
+        self.mlp = nn.Sequential(
+            nn.Linear(1024, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(256, num_target_classes)
+        )
 
     def forward(self, data):
         pos = data.x[:, :3]
@@ -563,14 +575,14 @@ def main():
         # model = BalancedPointNetPlusPlus(num_features=NUM_FEATURES, num_target_classes=TARGET_CLASSES)  # 2 features: intensity, return_number
     
     model = model.to(device)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    optimizer = optim.Adam(model.parameters(), lr=0.01)  # Increased from 0.001
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode='max',
-        factor=0.5,
-        patience=5,
+        factor=0.2,  # More aggressive reduction
+        patience=3,   # Reduced patience
         verbose=True,
-        min_lr=1e-5
+        min_lr=1e-6
     )
     
     # Calculate and apply balanced weights (important!)
@@ -604,19 +616,32 @@ def main():
         model.train()
         total_loss = 0
         num_batches = 0
-        class_predictions = defaultdict(int)
         progress_bar = tqdm(train_loader, desc="Training", leave=False, position=1)
 
         # Add gradient accumulation for larger effective batch size
         accumulation_steps = 4
         optimizer.zero_grad()
-
+        class_counts = torch.zeros(TARGET_CLASSES, device=device)
         for batch_idx, data in enumerate(progress_bar):
             data = data.to(device)
             
             try:
                 out = model(data)
                 loss = model.get_loss(out, data.y, criterion)
+                
+                # Monitor predictions
+                pred_classes = out.argmax(dim=1)
+                for c in range(TARGET_CLASSES):
+                    class_counts[c] += (pred_classes == c).sum().item()
+                
+                # Print detailed statistics periodically
+                if batch_idx % 10 == 0:
+                    print(f"\nBatch {batch_idx}")
+                    print(f"Loss: {loss.item():.4f}")
+                    print(f"Predictions distribution: {class_counts / class_counts.sum()}")
+                    print(f"Max prediction value: {out.max().item():.4f}")
+                    print(f"Min prediction value: {out.min().item():.4f}")
+                
                 scaled_loss = loss / accumulation_steps
                 scaled_loss.backward()
                 
@@ -625,10 +650,11 @@ def main():
                 num_batches += 1
                 
                 if (batch_idx + 1) % accumulation_steps == 0:
+                    # Add gradient clipping
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     optimizer.step()
                     optimizer.zero_grad()
                 
-                # Update progress bar with actual loss
                 current_avg_loss = total_loss / num_batches
                 progress_bar.set_postfix(loss=current_avg_loss)
                 
@@ -636,7 +662,7 @@ def main():
                 handle_cuda_error(e)
                 continue
 
-        return total_loss / num_batches  # Return average loss per batch
+        return total_loss / num_batches
 
     def evaluate(loader, iter):
         model.eval()
@@ -791,6 +817,13 @@ def main():
 
     unique_labels, label_counts = np.unique(all_labels_inv, return_counts=True)
     print("True class distribution:", dict(zip(unique_labels, label_counts)))
+
+    # Print class distribution
+    labels = np.concatenate([data.y.numpy() for data in train_data])
+    unique_labels, counts = np.unique(labels, return_counts=True)
+    print("\nClass distribution in training data:")
+    for label, count in zip(unique_labels, counts):
+        print(f"Class {label}: {count} samples ({count/len(labels)*100:.2f}%)")
 
 if __name__ == "__main__":
     
