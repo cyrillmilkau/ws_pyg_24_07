@@ -47,6 +47,26 @@ def handle_cuda_error(e):
     else:
         raise e  # Reraise the exception if it's not the one we want to catch
 
+def random_rotate_points(points):
+    # Random rotation around z-axis
+    theta = np.random.uniform(0, 2 * np.pi)
+    rotation_matrix = torch.tensor([
+        [np.cos(theta), -np.sin(theta), 0],
+        [np.sin(theta), np.cos(theta), 0],
+        [0, 0, 1]
+    ], dtype=torch.float32)
+    
+    xyz = points[:, :3]
+    rotated_xyz = torch.matmul(xyz, rotation_matrix.T)
+    points[:, :3] = rotated_xyz
+    return points
+
+def random_jitter(points, sigma=0.01, clip=0.05):
+    # Add random noise to coordinates
+    jittered_xyz = points[:, :3] + torch.randn_like(points[:, :3]) * sigma
+    points[:, :3] = torch.clamp(jittered_xyz, -clip, clip)
+    return points
+
 class PointCloudChunkedDataset(Dataset):
     def __init__(self, las_files, n_points=1000, label_mapping=None, transform=None, pre_transform=None):
         super().__init__(None, transform, pre_transform)
@@ -56,12 +76,10 @@ class PointCloudChunkedDataset(Dataset):
         self.point_chunks = []
         self.label_mapping = label_mapping
 
-        # Process files in smaller chunks
         for file_idx, las_file in enumerate(las_files):
             las = laspy.read(las_file)
             total_points = len(las.x)
-            # Reduce chunks per file
-            self.n_chunks = 15 # Reduced from 15
+            self.n_chunks = 15
             
             # Add stride to avoid always getting the same points
             stride = total_points // (self.n_chunks * 2)
@@ -97,6 +115,11 @@ class PointCloudChunkedDataset(Dataset):
         # y = torch.tensor(labels[start_idx:end_idx], dtype=torch.long)
         # y = torch.tensor([self.label_mapping[label] for label in labels if label in self.label_mapping], dtype=torch.long)
         y = torch.tensor([self.label_mapping.get(label, -1) for label in labels[start_idx:end_idx]], dtype=torch.long)
+
+        # Apply augmentation during training
+        if self.transform:
+            x = random_rotate_points(x)
+            x = random_jitter(x)
 
         # print(idx, x.shape, y.shape, "\r")
         self.pbar.update(1)
@@ -199,37 +222,37 @@ class PointNetPlusPlus(torch.nn.Module):
     def __init__(self, num_features, num_target_classes):
         super().__init__()
 
-        # Reduced network capacity
-        self.sa1_module = SAModule(0.5, 2, MLP([3 + num_features, 64, 64, 128]))  # More aggressive downsampling
-        self.sa2_module = SAModule(0.5, 4, MLP([128 + 3, 128, 128, 256]))
-        self.sa3_module = GlobalSAModule(MLP([256 + 3, 256, 256, 512]))  # Reduced feature dimension
+        # Increase network capacity and add more hierarchical levels
+        self.sa1_module = SAModule(0.5, 0.2, MLP([3 + num_features, 64, 128]))
+        self.sa2_module = SAModule(0.25, 0.4, MLP([128 + 3, 128, 256]))
+        self.sa3_module = SAModule(0.25, 0.8, MLP([256 + 3, 256, 512]))
+        self.sa4_module = GlobalSAModule(MLP([512 + 3, 512, 1024]))
 
-        self.mlp = MLP([512, 256, 128, num_target_classes], 
-                      dropout=0.3,
-                      batch_norm=True)
+        # Add more sophisticated classification head
+        self.mlp = nn.Sequential(
+            nn.Linear(1024, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(256, num_target_classes)
+        )
 
     def forward(self, data):
         pos = data.x[:, :3]
         features = data.x[:, 3:]
         batch = data.batch if hasattr(data, 'batch') else torch.zeros(pos.size(0), dtype=torch.long, device=pos.device)
 
-        # Process in smaller chunks if needed
         sa0_out = (features, pos, batch)
         sa1_out = self.sa1_module(*sa0_out)
         sa2_out = self.sa2_module(*sa1_out)
         sa3_out = self.sa3_module(*sa2_out)
+        sa4_out = self.sa4_module(*sa3_out)
         
-        x, _, _ = sa3_out
-
-        # More memory-efficient repeat
-        chunk_size = 1024
-        repeated_features = []
-        for i in range(0, N_POINTS, chunk_size):
-            end = min(i + chunk_size, N_POINTS)
-            chunk = x.repeat_interleave(end - i, dim=0)
-            repeated_features.append(chunk)
-        x = torch.cat(repeated_features, dim=0)
-        
+        x, _, _ = sa4_out
         return F.log_softmax(self.mlp(x), dim=-1)
 
 def load_model(model_path, in_channels, out_channels, device, model_type='mlp'):
@@ -358,25 +381,25 @@ def main():
         model = PointNetPlusPlus(num_features=2, num_target_classes=TARGET_CLASSES)  # 2 features: intensity, return_number
     
     model = model.to(device)
-    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', 
-                                                   factor=0.5, patience=5, 
-                                                   verbose=True)
+    optimizer = optim.Adam(model.parameters(), lr=0.0001, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='max',
+        factor=0.5,
+        patience=3,
+        verbose=True,
+        min_lr=1e-6
+    )
     
-    # Calculate better class weights
+    # Calculate and apply balanced weights (important!)
     total_samples = sum(counts)
     class_weights = torch.zeros(TARGET_CLASSES, device=device)
     for label, count in zip(unique_labels, counts):
-        if count > 0:  # Avoid division by zero
-            class_weights[label] = 1.0 / (count / total_samples)
+        if count > 0:
+            class_weights[label] = 1.0  # Set equal weights for all classes
     
-    # Normalize weights and apply log scaling to reduce extreme values
-    class_weights = torch.log1p(class_weights)
-    class_weights = class_weights / class_weights.sum()
-    print("Class weights:", class_weights)
-    
-    # criterion = nn.CrossEntropyLoss(weight=class_weights)
-    criterion = nn.CrossEntropyLoss()
+    # Use the weights in loss function
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
 
     """
     percent = 0.1
@@ -398,40 +421,49 @@ def main():
     def train():
         model.train()
         total_loss = 0
+        class_predictions = defaultdict(int)
         progress_bar = tqdm(train_loader, desc="Training", leave=False, position=1)
 
-        for data in progress_bar:
-            # Clear cache before each batch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
+        # Add gradient accumulation for larger effective batch size
+        accumulation_steps = 4  # Accumulate gradients over 4 batches
+        optimizer.zero_grad()
+
+        for batch_idx, data in enumerate(progress_bar):
             data = data.to(device)
-            optimizer.zero_grad()
             
             try:
                 out = model(data)
                 loss = criterion(out, data.y)
+                # Scale loss for gradient accumulation
+                loss = loss / accumulation_steps
                 loss.backward()
                 
-                # Add gradient clipping
+                # Gradient clipping
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 
-                optimizer.step()
-                total_loss += loss.item()
+                # Step optimizer only after accumulating gradients
+                if (batch_idx + 1) % accumulation_steps == 0:
+                    optimizer.step()
+                    optimizer.zero_grad()
+                
+                total_loss += loss.item() * accumulation_steps
+                
+                # Monitor predictions
+                pred = out.argmax(dim=1)
+                for p in pred.cpu().numpy():
+                    class_predictions[p] += 1
+                
             except RuntimeError as e:
-                if "out of memory" in str(e):
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    print(f"OOM error, skipping batch")
-                    if hasattr(optimizer, 'zero_grad'):
-                        optimizer.zero_grad()
-                    continue
-                else:
-                    raise e
+                handle_cuda_error(e)
+                continue
 
-            progress_bar.set_postfix(loss=loss.item())
+            progress_bar.set_postfix(loss=loss.item() * accumulation_steps)
 
-        progress_bar.close()
+        # Print class distribution
+        print("\nClass distribution in predictions:")
+        for cls, count in class_predictions.items():
+            print(f"Class {cls}: {count}")
+            
         return total_loss / len(train_loader)
 
     def evaluate(loader, iter):
@@ -483,13 +515,24 @@ def main():
     train_losses = []
     val_accuracies = []
 
+    # Implement warmup learning rate schedule
+    warmup_epochs = 5
+    def warmup_lr_scheduler(epoch):
+        if epoch < warmup_epochs:
+            return epoch / warmup_epochs
+        return scheduler.get_last_lr()[0]
+    
+    warmup_scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=warmup_lr_scheduler)
+    
     with tqdm(total=EPOCHS, desc="Epochs", unit="epoch", position=0) as pbar:
         for epoch in range(EPOCHS):
             train_loss = train()
             val_acc = evaluate(val_loader, epoch)
             
-            # Update learning rate based on validation accuracy
-            scheduler.step(val_acc)
+            if epoch < warmup_epochs:
+                warmup_scheduler.step()
+            else:
+                scheduler.step(val_acc)
             
             train_losses.append(train_loss)
             val_accuracies.append(val_acc)
