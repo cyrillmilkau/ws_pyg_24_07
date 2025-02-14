@@ -190,13 +190,12 @@ class MLPClassifier(nn.Module):
         # Standard cross-entropy loss
         ce_loss = criterion(pred, target)
         
-        # Add feature similarity loss if in training mode
-        if self.training:
-            similarity_loss = 0
-            # Implementation of feature similarity loss could go here
-            # This would encourage similar features within classes
-            # and dissimilar features between classes
-            return ce_loss + 0.1 * similarity_loss
+        # Print some statistics about predictions and targets
+        if random.random() < 0.01:  # Only print 1% of the time to avoid spam
+            print(f"\nLoss value: {ce_loss.item()}")
+            print(f"Pred shape: {pred.shape}, Target shape: {target.shape}")
+            print(f"Unique targets: {torch.unique(target).cpu().numpy()}")
+            print(f"Pred max/min: {pred.max().item()}/{pred.min().item()}")
         
         return ce_loss
 
@@ -271,13 +270,12 @@ class PointNetPlusPlus(torch.nn.Module):
         # Standard cross-entropy loss
         ce_loss = criterion(pred, target)
         
-        # Add feature similarity loss if in training mode
-        if self.training:
-            similarity_loss = 0
-            # Implementation of feature similarity loss could go here
-            # This would encourage similar features within classes
-            # and dissimilar features between classes
-            return ce_loss + 0.1 * similarity_loss
+        # Print some statistics about predictions and targets
+        if random.random() < 0.01:  # Only print 1% of the time to avoid spam
+            print(f"\nLoss value: {ce_loss.item()}")
+            print(f"Pred shape: {pred.shape}, Target shape: {target.shape}")
+            print(f"Unique targets: {torch.unique(target).cpu().numpy()}")
+            print(f"Pred max/min: {pred.max().item()}/{pred.min().item()}")
         
         return ce_loss
 
@@ -391,13 +389,12 @@ class BalancedPointNetPlusPlus(torch.nn.Module):
         # Standard cross-entropy loss
         ce_loss = criterion(pred, target)
         
-        # Add feature similarity loss if in training mode
-        if self.training:
-            similarity_loss = 0
-            # Implementation of feature similarity loss could go here
-            # This would encourage similar features within classes
-            # and dissimilar features between classes
-            return ce_loss + 0.1 * similarity_loss
+        # Print some statistics about predictions and targets
+        if random.random() < 0.01:  # Only print 1% of the time to avoid spam
+            print(f"\nLoss value: {ce_loss.item()}")
+            print(f"Pred shape: {pred.shape}, Target shape: {target.shape}")
+            print(f"Unique targets: {torch.unique(target).cpu().numpy()}")
+            print(f"Pred max/min: {pred.max().item()}/{pred.min().item()}")
         
         return ce_loss
 
@@ -566,14 +563,14 @@ def main():
         # model = BalancedPointNetPlusPlus(num_features=NUM_FEATURES, num_target_classes=TARGET_CLASSES)  # 2 features: intensity, return_number
     
     model = model.to(device)
-    optimizer = optim.Adam(model.parameters(), lr=0.0001, weight_decay=1e-4)
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode='max',
         factor=0.5,
-        patience=3,
+        patience=5,
         verbose=True,
-        min_lr=1e-6
+        min_lr=1e-5
     )
     
     # Calculate and apply balanced weights (important!)
@@ -606,11 +603,12 @@ def main():
     def train():
         model.train()
         total_loss = 0
+        num_batches = 0
         class_predictions = defaultdict(int)
         progress_bar = tqdm(train_loader, desc="Training", leave=False, position=1)
 
         # Add gradient accumulation for larger effective batch size
-        accumulation_steps = 4  # Accumulate gradients over 4 batches
+        accumulation_steps = 4
         optimizer.zero_grad()
 
         for batch_idx, data in enumerate(progress_bar):
@@ -618,38 +616,27 @@ def main():
             
             try:
                 out = model(data)
-                # Use custom loss function
                 loss = model.get_loss(out, data.y, criterion)
-                loss = loss / accumulation_steps
-                loss.backward()
+                scaled_loss = loss / accumulation_steps
+                scaled_loss.backward()
                 
-                # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                # Track the actual (unscaled) loss
+                total_loss += loss.item()
+                num_batches += 1
                 
-                # Step optimizer only after accumulating gradients
                 if (batch_idx + 1) % accumulation_steps == 0:
                     optimizer.step()
                     optimizer.zero_grad()
                 
-                total_loss += loss.item() * accumulation_steps
-                
-                # Monitor predictions
-                pred = out.argmax(dim=1)
-                for p in pred.cpu().numpy():
-                    class_predictions[p] += 1
+                # Update progress bar with actual loss
+                current_avg_loss = total_loss / num_batches
+                progress_bar.set_postfix(loss=current_avg_loss)
                 
             except RuntimeError as e:
                 handle_cuda_error(e)
                 continue
 
-            progress_bar.set_postfix(loss=loss.item() * accumulation_steps)
-
-        # Print class distribution
-        # print("\nClass distribution in predictions:")
-        # for cls, count in class_predictions.items():
-        #     print(f"Class {cls}: {count}")
-            
-        return total_loss / len(train_loader)
+        return total_loss / num_batches  # Return average loss per batch
 
     def evaluate(loader, iter):
         model.eval()
@@ -732,18 +719,33 @@ def main():
         pbar.close()
     
     # Plot training loss and validation accuracy
-    plt.figure(figsize=(10, 5))
+    plt.figure(figsize=(12, 5))
+
+    # Create two subplots
+    plt.subplot(1, 2, 1)
     plt.plot(range(1, EPOCHS+1), train_losses, label="Train Loss", color="blue")
+    plt.xlabel("Epochs")
+    plt.ylabel("Loss")
+    plt.title("Training Loss Over Epochs")
+    plt.legend()
+    plt.grid(True)
+
+    plt.subplot(1, 2, 2)
     plt.plot(range(1, EPOCHS+1), val_accuracies, label="Validation Accuracy", color="red")
     plt.xlabel("Epochs")
-    plt.ylabel("Loss / Accuracy")
-    plt.yscale("log")  # Set y-axis to log scale
-    plt.title("Training Loss & Validation Accuracy Over Epochs")
+    plt.ylabel("Accuracy")
+    plt.title("Validation Accuracy Over Epochs")
     plt.legend()
-    plt.grid()
-    plt.savefig(os.path.join(folder_dir,"training_plot.png"))  # Save the figure
-    plt.savefig("training_plot.png")  # Save the figure
-    # plt.show()
+    plt.grid(True)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(folder_dir, "training_plot.png"))
+    plt.savefig("training_plot.png")
+    plt.close()
+
+    # Also save the raw values for later analysis
+    np.save(os.path.join(folder_dir, "train_losses.npy"), np.array(train_losses))
+    np.save(os.path.join(folder_dir, "val_accuracies.npy"), np.array(val_accuracies))
 
     test_acc = evaluate(test_loader, EPOCHS)
     print(f"Test Accuracy: {test_acc:.4f}")
