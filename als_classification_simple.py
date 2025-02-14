@@ -1,17 +1,18 @@
+import os
 import laspy
 import torch
-import math
-from torch_geometric.data import Data, Dataset
 import numpy as np
-import os
 import glob
 import random 
 import subprocess
-from datetime import datetime
 import time
+import matplotlib.pyplot as plt
 
-from torch_geometric.data import DataLoader
-from sklearn.model_selection import train_test_split
+from datetime import datetime
+from collections import defaultdict
+
+from torch_geometric.data import Data, Dataset, DataLoader
+from torch_geometric.nn import MLP, PointNetConv, global_max_pool, fps, radius
 
 from tqdm.auto import tqdm
 import torch.nn as nn
@@ -19,21 +20,18 @@ import torch.nn.functional as F
 import torch.optim as optim
 
 from sklearn.decomposition import PCA
-import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
 
 from util.ClassificationLabels import ClassificationLabels
 
-from collections import defaultdict
+N_POINTS        = 2**15             # points per chunk
+EPOCHS          = 100               # epochs of training/evaluating
+BATCH_SIZE      = 32                # 
+TARGET_CLASSES  = 14                # depends on training dataset(s)
+NUM_FEATURES    = 0                 # xyz,intensity,return_number
+IN_CHANNELS     = 3                 # 3 if xyz only; 4 if with intensity; 5 if add with return_number
+OUT_CHANNELS    = TARGET_CLASSES
 
-from torch_geometric.nn import MLP, knn_interpolate, PointNetConv, global_max_pool, fps, radius
-
-N_POINTS = 2**15  # 4096 points per chunk
-EPOCHS = 1000      # Still enough to learn
-BATCH_SIZE = 32    # Increased from 8 to ensure enough samples after balancing
-TARGET_CLASSES = 14
-NUM_FEATURES = 0 # xyz,intensity,return_number
-IN_CHANNELS = 3 # 3 if xyz only
-OUT_CHANNELS = TARGET_CLASSES
 def reset_gpu():
     try:
         subprocess.run(['nvidia-smi', '--gpu-reset'], check=True)
@@ -74,15 +72,13 @@ class PointCloudChunkedDataset(Dataset):
         super().__init__(None, transform, pre_transform)
         self.las_files = las_files
         self.n_points = n_points
-        self.n_chunks = 0
+        self.n_chunks = 10
         self.point_chunks = []
         self.label_mapping = label_mapping
 
         for file_idx, las_file in enumerate(las_files):
             las = laspy.read(las_file)
             total_points = len(las.x)
-            # Reduce chunks per file
-            self.n_chunks = 20
             
             # Add stride to avoid always getting the same points
             stride = total_points // (self.n_chunks * 2)
@@ -106,7 +102,7 @@ class PointCloudChunkedDataset(Dataset):
         # feature_list.append(np.array(las.intensity, dtype=np.float32))        # intensity
         # feature_list.append(np.array(las.return_number, dtype=np.float32))    # return_number
         
-        features = np.column_stack(feature for feature in feature_list)
+        features = np.column_stack([feature for feature in feature_list])
         # print(f"features: {len(features)}")
         # indices = random.sample(range(len(features)), min(self.n_points, len(features)))
         
@@ -114,13 +110,8 @@ class PointCloudChunkedDataset(Dataset):
         labels = np.array(las.classification, dtype=np.int64)
 
         # Extract the sequential chunk
-        end_idx = start_idx + self.n_points
-        # print(f"start_idx: {start_idx}")
-        # print(f"start_idx: {end_idx}")
-        x = torch.tensor(features[start_idx:end_idx], dtype=torch.float)
-        # y = torch.tensor(labels[start_idx:end_idx], dtype=torch.long)
-        # y = torch.tensor([self.label_mapping[label] for label in labels if label in self.label_mapping], dtype=torch.long)
-        y = torch.tensor([self.label_mapping.get(label, -1) for label in labels[start_idx:end_idx]], dtype=torch.long)
+        x = torch.tensor(features[start_idx:start_idx + self.n_points], dtype=torch.float)
+        y = torch.tensor([self.label_mapping.get(label, -1) for label in labels[start_idx:start_idx + self.n_points]], dtype=torch.long)
 
         # Apply augmentation during training
         if self.transform:
@@ -146,13 +137,12 @@ class PointCloudDataset(Dataset):
         las = laspy.read(self.las_files[idx])
         
         # Extract features (modify based on available attributes)
-        xyz = np.vstack((las.x, las.y, las.z)).T
-        intensity = np.array(las.intensity, dtype=np.float32)
-        return_number = np.array(las.return_number, dtype=np.float32)
-        
-        # Stack features
-        features = np.column_stack((xyz, intensity, return_number))
-        # features = np.column_stack((xyz))
+        feature_list = []
+        feature_list.append(np.column_stack((las.x, las.y, las.z)))             # xyz
+        # feature_list.append(np.array(las.intensity, dtype=np.float32))        # intensity
+        # feature_list.append(np.array(las.return_number, dtype=np.float32))    # return_number
+
+        features = np.column_stack([feature for feature in feature_list])
         
         # Extract labels (classification field)
         labels = np.array(las.classification, dtype=np.int64)
@@ -441,15 +431,17 @@ def load_model(model_path, in_channels, out_channels, device, model_type='mlp'):
 def classify_point_cloud(model, las_file, device, model_type='mlp'):
     las = laspy.read(las_file)
     
-    # Extract features
-    xyz = np.column_stack((las.x, las.y, las.z))
-    intensity = np.array(las.intensity, dtype=np.float32)
-    return_number = np.array(las.return_number, dtype=np.float32)
-    features = np.column_stack((xyz, intensity, return_number))
-    
+    # Extract features --> TODO Option in constructor
+    feature_list = []
+    feature_list.append(np.column_stack((las.x, las.y, las.z)))             # xyz
+    # feature_list.append(np.array(las.intensity, dtype=np.float32))        # intensity
+    # feature_list.append(np.array(las.return_number, dtype=np.float32))    # return_number
+
+    features = np.column_stack([feature for feature in feature_list])
+
     # Process in batches to avoid memory issues
     predictions = []
-    batch_size = 32768
+    batch_size = 8192 # 2048 32768 --> TODO automatic deduction
     total_points = len(features) # 10_000_000
     total_predicted = 0
     # num_batches = len(features) // batch_size + (1 if len(features) % batch_size != 0 else 0)
@@ -520,7 +512,7 @@ def main():
     # dataset = PointCloudDataset(las_files, n_points=N_POINTS)
     dataset = PointCloudChunkedDataset(las_files, n_points=N_POINTS, label_mapping=label_mapping)
 
-    folder_name = datetime.now().strftime("%Y-%M-%D-%H-%M") + f"_FILES_{len(las_files)}_POINTS_{N_POINTS}_CHUNKS_{dataset.n_chunks}_EPOCHS_{EPOCHS}"
+    folder_name = datetime.now().strftime('%Y-%m-%d %H:%M:%S') + f"_FILES_{len(las_files)}_POINTS_{N_POINTS}_CHUNKS_{dataset.n_chunks}_EPOCHS_{EPOCHS}"
     folder_dir = os.path.join("./output/", folder_name)
     os.makedirs(folder_dir, exist_ok=True)
 
@@ -570,8 +562,8 @@ def main():
     if model_type == 'mlp':
         model = MLPClassifier(in_channels=IN_CHANNELS, out_channels=OUT_CHANNELS)
     else:  # pointnet++
-        # model = PointNetPlusPlus(num_features=NUM_FEATURES, num_target_classes=TARGET_CLASSES)  # 2 features: intensity, return_number
-        model = BalancedPointNetPlusPlus(num_features=NUM_FEATURES, num_target_classes=TARGET_CLASSES)  # 2 features: intensity, return_number
+        model = PointNetPlusPlus(num_features=NUM_FEATURES, num_target_classes=TARGET_CLASSES)  # 2 features: intensity, return_number
+        # model = BalancedPointNetPlusPlus(num_features=NUM_FEATURES, num_target_classes=TARGET_CLASSES)  # 2 features: intensity, return_number
     
     model = model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=0.0001, weight_decay=1e-4)
@@ -653,9 +645,9 @@ def main():
             progress_bar.set_postfix(loss=loss.item() * accumulation_steps)
 
         # Print class distribution
-        print("\nClass distribution in predictions:")
-        for cls, count in class_predictions.items():
-            print(f"Class {cls}: {count}")
+        # print("\nClass distribution in predictions:")
+        # for cls, count in class_predictions.items():
+        #     print(f"Class {cls}: {count}")
             
         return total_loss / len(train_loader)
 
@@ -691,7 +683,7 @@ def main():
             
             print("\nConfusion Matrix:")
             classes = sorted(class_total.keys())
-            print("True\Pred", end="\n")
+            print("True\Pred", end="\n\t")
             for c in classes:
                 print(f"{c}", end="\t")
             print()
@@ -785,24 +777,27 @@ def main():
 
     all_preds = np.concatenate(all_preds)
     all_labels = np.concatenate(all_labels)
+    all_preds_inv = np.array([label_mapping_inv.get(pred, -1) for pred in all_preds])
+    all_labels_inv = np.array([label_mapping_inv.get(label, -1) for label in all_labels])
 
-    unique_preds, pred_counts = np.unique(all_preds, return_counts=True)
+    # Optional: Check if any None values are present in the result
+    if np.any(all_preds_inv == -1):  # Replace -1 with the missing value or logic to handle it
+        print("Warning: Some predictions could not be mapped.")
+
+    unique_preds, pred_counts = np.unique(all_preds_inv, return_counts=True)
     print("Predicted class distribution:", dict(zip(unique_preds, pred_counts)))
 
-    unique_labels, label_counts = np.unique(all_labels, return_counts=True)
+    unique_labels, label_counts = np.unique(all_labels_inv, return_counts=True)
     print("True class distribution:", dict(zip(unique_labels, label_counts)))
-
-    all_features = np.concatenate([data.x.cpu().numpy() for data in test_loader])
-    pca = PCA(n_components=2)
-    reduced_features = pca.fit_transform(all_features)
-    plt.scatter(reduced_features[:, 0], reduced_features[:, 1], alpha=0.5)
-    plt.title("Feature Space (PCA Projection)")
-    plt.savefig(os.path.join(folder_dir,"reduced_features_plot.png"))
 
 if __name__ == "__main__":
     
     main()
     
-    # model_path = "/workspace/output/00-29_FILES_16_POINTS_32768_CHUNKS_20_EPOCHS_1000/pointnet++_EPOCH_357_classifier.pth"
-    # las_file_path = "/workspace/data/general/pc2011/pc2011_11245000_RANDOM_SUBSAMPLED_2025-02-10_23h17_29_325.las"
+    # # model_path = "/workspace/output/2025-41-02/14/25-10-41_FILES_4_POINTS_2048_CHUNKS_20_EPOCHS_100/pointnet++_EPOCH_99_classifier.pth"
+    # model_path = "/workspace/output/2025-02-14 11:05:12_FILES_4_POINTS_2048_CHUNKS_20_EPOCHS_100/pointnet++_EPOCH_99_classifier.pth"
+    # # model_path = "/workspace/output/2025-02-14 11:34:15_FILES_5_POINTS_8192_CHUNKS_20_EPOCHS_100/pointnet++_EPOCH_99_classifier.pth"
+    # las_file_path = "/workspace/data/general/BA_Schneider/ALS20082012_410000-5745000_LAS12.las"
+    # # las_file_path = "/workspace/data/train/a/pc2011_12245200_SUBSAMPLED_2025-02-10_23h34_52_821.las"
+    # # las_file_path = "/workspace/data/train/a/pc2011_11245001_SUBSAMPLED_2025-02-10_23h18_33_167.las"
     # main_classify(model_path, las_file_path)
