@@ -27,8 +27,8 @@ from collections import defaultdict
 
 from torch_geometric.nn import MLP, knn_interpolate, PointNetConv, global_max_pool, fps, radius
 
-N_POINTS = 2**12  # 4096 points per chunk
-EPOCHS = 200      # Still enough to learn
+N_POINTS = 2**15  # 4096 points per chunk
+EPOCHS = 1000      # Still enough to learn
 BATCH_SIZE = 8    # Smaller batch size
 TARGET_CLASSES = 14
 
@@ -61,7 +61,7 @@ class PointCloudChunkedDataset(Dataset):
             las = laspy.read(las_file)
             total_points = len(las.x)
             # Reduce chunks per file
-            self.n_chunks = 10  # Reduced from 15
+            self.n_chunks = 15 # Reduced from 15
             
             # Add stride to avoid always getting the same points
             stride = total_points // (self.n_chunks * 2)
@@ -293,7 +293,7 @@ def main():
     torch.cuda.empty_cache()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    las_files = glob.glob("/workspace/data/train/a2/*.las")
+    las_files = glob.glob("/workspace/data/train/a/*.las")
 
     valid_labels = ClassificationLabels("Vorarlberg").class_labels
     mapped_labels = np.arange(len(valid_labels))
@@ -375,7 +375,8 @@ def main():
     class_weights = class_weights / class_weights.sum()
     print("Class weights:", class_weights)
     
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    # criterion = nn.CrossEntropyLoss(weight=class_weights)
+    criterion = nn.CrossEntropyLoss()
 
     """
     percent = 0.1
