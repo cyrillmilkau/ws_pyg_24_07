@@ -223,37 +223,37 @@ class PointNetPlusPlus(torch.nn.Module):
     def __init__(self, num_features, num_target_classes):
         super().__init__()
 
-        # Increase network capacity and add more hierarchical levels
-        self.sa1_module = SAModule(0.5, 0.2, MLP([3 + num_features, 64, 128]))
-        self.sa2_module = SAModule(0.25, 0.4, MLP([128 + 3, 128, 256]))
-        self.sa3_module = SAModule(0.25, 0.8, MLP([256 + 3, 256, 512]))
-        self.sa4_module = GlobalSAModule(MLP([512 + 3, 512, 1024]))
+        # Reduced network capacity
+        self.sa1_module = SAModule(0.5, 2, MLP([3 + num_features, 64, 64, 128]))  # More aggressive downsampling
+        self.sa2_module = SAModule(0.5, 4, MLP([128 + 3, 128, 128, 256]))
+        self.sa3_module = GlobalSAModule(MLP([256 + 3, 256, 256, 512]))  # Reduced feature dimension
 
-        # Add more sophisticated classification head
-        self.mlp = nn.Sequential(
-            nn.Linear(1024, 512),
-            nn.BatchNorm1d(512),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(512, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(256, num_target_classes)
-        )
+        self.mlp = MLP([512, 256, 128, num_target_classes], 
+                      dropout=0.3,
+                      batch_norm=True)
 
     def forward(self, data):
         pos = data.x[:, :3]
         features = data.x[:, 3:]
         batch = data.batch if hasattr(data, 'batch') else torch.zeros(pos.size(0), dtype=torch.long, device=pos.device)
 
+        # Process in smaller chunks if needed
         sa0_out = (features, pos, batch)
         sa1_out = self.sa1_module(*sa0_out)
         sa2_out = self.sa2_module(*sa1_out)
         sa3_out = self.sa3_module(*sa2_out)
-        sa4_out = self.sa4_module(*sa3_out)
         
-        x, _, _ = sa4_out
+        x, _, _ = sa3_out
+
+        # More memory-efficient repeat
+        chunk_size = 1024
+        repeated_features = []
+        for i in range(0, N_POINTS, chunk_size):
+            end = min(i + chunk_size, N_POINTS)
+            chunk = x.repeat_interleave(end - i, dim=0)
+            repeated_features.append(chunk)
+        x = torch.cat(repeated_features, dim=0)
+        
         return F.log_softmax(self.mlp(x), dim=-1)
 
 def load_model(model_path, in_channels, out_channels, device, model_type='mlp'):
