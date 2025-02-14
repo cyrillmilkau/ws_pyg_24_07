@@ -29,10 +29,10 @@ from torch_geometric.nn import MLP, knn_interpolate, PointNetConv, global_max_po
 
 N_POINTS = 2**15  # 4096 points per chunk
 EPOCHS = 1000      # Still enough to learn
-BATCH_SIZE = 8    # Smaller batch size
+BATCH_SIZE = 32    # Increased from 8 to ensure enough samples after balancing
 TARGET_CLASSES = 14
 NUM_FEATURES = 0 # xyz,intensity,return_number
-IN_CHANNELS = 5 # 3 if xyz only
+IN_CHANNELS = 3 # 3 if xyz only
 OUT_CHANNELS = TARGET_CLASSES
 def reset_gpu():
     try:
@@ -322,12 +322,20 @@ class BalancedPointNetPlusPlus(torch.nn.Module):
             if label >= 0:  # Ignore invalid labels
                 class_indices[label.item()].append(idx)
         
+        # Filter out empty classes
+        active_classes = [c for c in class_indices.keys() if len(class_indices[c]) > 0]
+        
+        if len(active_classes) < 2:
+            # If less than 2 classes in batch, return original to avoid batch norm issues
+            return x, y
+        
         # Determine number of points to sample per class
         min_points = min(len(indices) for indices in class_indices.values() if len(indices) > 0)
-        points_per_class = min(min_points, self.points_per_class)
+        points_per_class = max(2, min(min_points, self.points_per_class))  # Ensure at least 2 points
         
         # Sample equal numbers of points from each class
-        for class_idx, indices in class_indices.items():
+        for class_idx in active_classes:
+            indices = class_indices[class_idx]
             if len(indices) > 0:
                 sampled_indices = torch.tensor(
                     random.sample(indices, points_per_class), 
