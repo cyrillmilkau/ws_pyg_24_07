@@ -190,6 +190,21 @@ class MLPClassifier(nn.Module):
         x = self.fc4(x)
         return F.log_softmax(x, dim=1)
 
+    def get_loss(self, pred, target, criterion):
+        """Custom loss function incorporating feature similarity"""
+        # Standard cross-entropy loss
+        ce_loss = criterion(pred, target)
+        
+        # Add feature similarity loss if in training mode
+        if self.training:
+            similarity_loss = 0
+            # Implementation of feature similarity loss could go here
+            # This would encourage similar features within classes
+            # and dissimilar features between classes
+            return ce_loss + 0.1 * similarity_loss
+        
+        return ce_loss
+
 class SAModule(torch.nn.Module):
     def __init__(self, ratio, r, nn):
         super().__init__()
@@ -255,6 +270,133 @@ class PointNetPlusPlus(torch.nn.Module):
         x = torch.cat(repeated_features, dim=0)
         
         return F.log_softmax(self.mlp(x), dim=-1)
+
+    def get_loss(self, pred, target, criterion):
+        """Custom loss function incorporating feature similarity"""
+        # Standard cross-entropy loss
+        ce_loss = criterion(pred, target)
+        
+        # Add feature similarity loss if in training mode
+        if self.training:
+            similarity_loss = 0
+            # Implementation of feature similarity loss could go here
+            # This would encourage similar features within classes
+            # and dissimilar features between classes
+            return ce_loss + 0.1 * similarity_loss
+        
+        return ce_loss
+
+class BalancedPointNetPlusPlus(torch.nn.Module):
+    def __init__(self, num_features, num_target_classes, points_per_class=1024):
+        super().__init__()
+        self.points_per_class = points_per_class
+        self.num_target_classes = num_target_classes
+        
+        # Same architecture as PointNet++
+        self.sa1_module = SAModule(0.5, 2, MLP([3 + num_features, 64, 64, 128]))
+        self.sa2_module = SAModule(0.5, 4, MLP([128 + 3, 128, 128, 256]))
+        self.sa3_module = GlobalSAModule(MLP([256 + 3, 256, 256, 512]))
+
+        self.mlp = MLP([512, 256, 128, num_target_classes], 
+                      dropout=0.3,
+                      batch_norm=True)
+        
+        # Class-wise feature banks to store representative features
+        self.feature_banks = {i: [] for i in range(num_target_classes)}
+        self.max_bank_size = 1000  # Maximum features to store per class
+        
+    def balance_batch(self, x, y):
+        """Balance the batch by sampling equal points from each class"""
+        device = x.device
+        balanced_x = []
+        balanced_y = []
+        
+        # Group points by class
+        class_indices = {i: [] for i in range(self.num_target_classes)}
+        for idx, label in enumerate(y):
+            if label >= 0:  # Ignore invalid labels
+                class_indices[label.item()].append(idx)
+        
+        # Determine number of points to sample per class
+        min_points = min(len(indices) for indices in class_indices.values() if len(indices) > 0)
+        points_per_class = min(min_points, self.points_per_class)
+        
+        # Sample equal numbers of points from each class
+        for class_idx, indices in class_indices.items():
+            if len(indices) > 0:
+                sampled_indices = torch.tensor(
+                    random.sample(indices, points_per_class), 
+                    device=device
+                )
+                balanced_x.append(x[sampled_indices])
+                balanced_y.extend([class_idx] * points_per_class)
+        
+        if len(balanced_x) > 0:
+            balanced_x = torch.cat(balanced_x, dim=0)
+            balanced_y = torch.tensor(balanced_y, device=device)
+            return balanced_x, balanced_y
+        return x, y  # Return original if balancing fails
+
+    def update_feature_banks(self, features, labels):
+        """Update class-wise feature banks with new features"""
+        with torch.no_grad():
+            for feat, label in zip(features, labels):
+                if label >= 0:  # Ignore invalid labels
+                    label = label.item()
+                    self.feature_banks[label].append(feat.detach().cpu())
+                    # Keep bank size limited
+                    if len(self.feature_banks[label]) > self.max_bank_size:
+                        self.feature_banks[label].pop(0)
+
+    def forward(self, data):
+        pos = data.x[:, :3]
+        features = data.x[:, 3:]
+        batch = data.batch if hasattr(data, 'batch') else torch.zeros(pos.size(0), dtype=torch.long, device=pos.device)
+
+        # Balance the input if in training mode
+        if self.training:
+            pos, data.y = self.balance_batch(pos, data.y)
+            features = features[:pos.size(0)]  # Adjust features to match balanced positions
+            batch = batch[:pos.size(0)]  # Adjust batch indices
+        
+        # Process through PointNet++ layers
+        sa0_out = (features, pos, batch)
+        sa1_out = self.sa1_module(*sa0_out)
+        sa2_out = self.sa2_module(*sa1_out)
+        sa3_out = self.sa3_module(*sa2_out)
+        
+        x, _, _ = sa3_out
+        
+        # Update feature banks during training
+        if self.training:
+            self.update_feature_banks(x, data.y)
+        
+        # More memory-efficient repeat for prediction
+        if not self.training:
+            chunk_size = 1024
+            repeated_features = []
+            for i in range(0, N_POINTS, chunk_size):
+                end = min(i + chunk_size, N_POINTS)
+                chunk = x.repeat_interleave(end - i, dim=0)
+                repeated_features.append(chunk)
+            x = torch.cat(repeated_features, dim=0)
+        
+        return F.log_softmax(self.mlp(x), dim=-1)
+
+    def get_loss(self, pred, target, criterion):
+        """Custom loss function incorporating feature similarity"""
+        # Standard cross-entropy loss
+        ce_loss = criterion(pred, target)
+        
+        # Add feature similarity loss if in training mode
+        if self.training:
+            similarity_loss = 0
+            # Implementation of feature similarity loss could go here
+            # This would encourage similar features within classes
+            # and dissimilar features between classes
+            return ce_loss + 0.1 * similarity_loss
+        
+        return ce_loss
 
 def load_model(model_path, in_channels, out_channels, device, model_type='mlp'):
     if model_type == 'mlp':
@@ -415,7 +557,8 @@ def main():
     if model_type == 'mlp':
         model = MLPClassifier(in_channels=5, out_channels=TARGET_CLASSES)
     else:  # pointnet++
-        model = PointNetPlusPlus(num_features=2, num_target_classes=TARGET_CLASSES)  # 2 features: intensity, return_number
+        # model = PointNetPlusPlus(num_features=2, num_target_classes=TARGET_CLASSES)  # 2 features: intensity, return_number
+        model = BalancedPointNetPlusPlus(num_features=2, num_target_classes=TARGET_CLASSES)  # 2 features: intensity, return_number
     
     model = model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=0.0001, weight_decay=1e-4)
@@ -470,8 +613,8 @@ def main():
             
             try:
                 out = model(data)
-                loss = criterion(out, data.y)
-                # Scale loss for gradient accumulation
+                # Use custom loss function
+                loss = model.get_loss(out, data.y, criterion)
                 loss = loss / accumulation_steps
                 loss.backward()
                 
