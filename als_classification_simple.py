@@ -31,7 +31,9 @@ N_POINTS = 2**15  # 4096 points per chunk
 EPOCHS = 1000      # Still enough to learn
 BATCH_SIZE = 8    # Smaller batch size
 TARGET_CLASSES = 14
-
+NUM_FEATURES = 0 # xyz,intensity,return_number
+IN_CHANNELS = 5 # 3 if xyz only
+OUT_CHANNELS = TARGET_CLASSES
 def reset_gpu():
     try:
         subprocess.run(['nvidia-smi', '--gpu-reset'], check=True)
@@ -80,7 +82,7 @@ class PointCloudChunkedDataset(Dataset):
             las = laspy.read(las_file)
             total_points = len(las.x)
             # Reduce chunks per file
-            self.n_chunks = 20 # Reduced from 15
+            self.n_chunks = 20
             
             # Add stride to avoid always getting the same points
             stride = total_points // (self.n_chunks * 2)
@@ -98,15 +100,18 @@ class PointCloudChunkedDataset(Dataset):
         file_idx, start_idx = self.point_chunks[idx]
         las = laspy.read(self.las_files[file_idx])
         
-        # Extract features
-        xyz = np.column_stack((las.x, las.y, las.z))
-        intensity = np.array(las.intensity, dtype=np.float32)
-        return_number = np.array(las.return_number, dtype=np.float32)
-        labels = np.array(las.classification, dtype=np.int64) # - 1  # Ensure zero-based labels
-
-        features = np.column_stack((xyz, intensity, return_number))
+        # Extract features --> TODO Option in constructor
+        feature_list = []
+        feature_list.append(np.column_stack((las.x, las.y, las.z)))             # xyz
+        # feature_list.append(np.array(las.intensity, dtype=np.float32))        # intensity
+        # feature_list.append(np.array(las.return_number, dtype=np.float32))    # return_number
+        
+        features = np.column_stack(feature for feature in feature_list)
         # print(f"features: {len(features)}")
         # indices = random.sample(range(len(features)), min(self.n_points, len(features)))
+        
+        # Extract labels
+        labels = np.array(las.classification, dtype=np.int64)
 
         # Extract the sequential chunk
         end_idx = start_idx + self.n_points
@@ -402,7 +407,7 @@ def load_model(model_path, in_channels, out_channels, device, model_type='mlp'):
     if model_type == 'mlp':
         model = MLPClassifier(in_channels, out_channels)
     else:  # pointnet++
-        model = PointNetPlusPlus(num_features=2, num_target_classes=out_channels)
+        model = PointNetPlusPlus(num_features=NUM_FEATURES, num_target_classes=out_channels)
     
     checkpoint = torch.load(model_path, map_location=device)
 
@@ -484,7 +489,7 @@ def save_reclassified_las(las_file, n_points, new_labels, output_file):
 def main_classify(model_path, las_file_path):
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = load_model(model_path, in_channels=5, out_channels=TARGET_CLASSES, device=device, model_type="pointnet++")
+    model = load_model(model_path, in_channels=IN_CHANNELS, out_channels=TARGET_CLASSES, device=device, model_type="pointnet++")
 
     new_labels = classify_point_cloud(model=model, las_file=las_file_path, device=device, model_type="pointnet++")
 
@@ -495,7 +500,7 @@ def main():
     torch.cuda.empty_cache()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    las_files = glob.glob("/workspace/data/train/a/*.las")
+    las_files = glob.glob("/workspace/data/train/a2/*.las")
 
     valid_labels = ClassificationLabels("Vorarlberg").class_labels
     mapped_labels = np.arange(len(valid_labels))
@@ -507,7 +512,7 @@ def main():
     # dataset = PointCloudDataset(las_files, n_points=N_POINTS)
     dataset = PointCloudChunkedDataset(las_files, n_points=N_POINTS, label_mapping=label_mapping)
 
-    folder_name = datetime.now().strftime("%H-%M") + f"_FILES_{len(las_files)}_POINTS_{N_POINTS}_CHUNKS_{dataset.n_chunks}_EPOCHS_{EPOCHS}"
+    folder_name = datetime.now().strftime("%Y-%M-%D-%H-%M") + f"_FILES_{len(las_files)}_POINTS_{N_POINTS}_CHUNKS_{dataset.n_chunks}_EPOCHS_{EPOCHS}"
     folder_dir = os.path.join("./output/", folder_name)
     os.makedirs(folder_dir, exist_ok=True)
 
@@ -555,10 +560,10 @@ def main():
 
     # Initialize model based on type
     if model_type == 'mlp':
-        model = MLPClassifier(in_channels=5, out_channels=TARGET_CLASSES)
+        model = MLPClassifier(in_channels=IN_CHANNELS, out_channels=OUT_CHANNELS)
     else:  # pointnet++
-        # model = PointNetPlusPlus(num_features=2, num_target_classes=TARGET_CLASSES)  # 2 features: intensity, return_number
-        model = BalancedPointNetPlusPlus(num_features=2, num_target_classes=TARGET_CLASSES)  # 2 features: intensity, return_number
+        # model = PointNetPlusPlus(num_features=NUM_FEATURES, num_target_classes=TARGET_CLASSES)  # 2 features: intensity, return_number
+        model = BalancedPointNetPlusPlus(num_features=NUM_FEATURES, num_target_classes=TARGET_CLASSES)  # 2 features: intensity, return_number
     
     model = model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=0.0001, weight_decay=1e-4)
@@ -787,11 +792,9 @@ def main():
     plt.savefig(os.path.join(folder_dir,"reduced_features_plot.png"))
 
 if __name__ == "__main__":
-    # try:
-    #     main()
-    # except RuntimeError as e:
-    #     handle_cuda_error(e)  # Handle error if occurs
-    # main()
-    model_path = "/workspace/output/00-29_FILES_16_POINTS_32768_CHUNKS_20_EPOCHS_1000/pointnet++_EPOCH_357_classifier.pth"
-    las_file_path = "/workspace/data/general/pc2011/pc2011_11245000_RANDOM_SUBSAMPLED_2025-02-10_23h17_29_325.las"
-    main_classify(model_path, las_file_path)
+    
+    main()
+    
+    # model_path = "/workspace/output/00-29_FILES_16_POINTS_32768_CHUNKS_20_EPOCHS_1000/pointnet++_EPOCH_357_classifier.pth"
+    # las_file_path = "/workspace/data/general/pc2011/pc2011_11245000_RANDOM_SUBSAMPLED_2025-02-10_23h17_29_325.las"
+    # main_classify(model_path, las_file_path)
