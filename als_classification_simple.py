@@ -19,7 +19,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
-from sklearn.decomposition import PCA
 from sklearn.model_selection import train_test_split
 
 from util.ClassificationLabels import ClassificationLabels
@@ -31,21 +30,6 @@ TARGET_CLASSES  = 14                # depends on training dataset(s)
 NUM_FEATURES    = 0                 # xyz,intensity,return_number
 IN_CHANNELS     = 3                 # 3 if xyz only; 4 if with intensity; 5 if add with return_number
 OUT_CHANNELS    = TARGET_CLASSES
-
-def reset_gpu():
-    try:
-        subprocess.run(['nvidia-smi', '--gpu-reset'], check=True)
-        print("GPU reset successfully.")
-    except subprocess.CalledProcessError as e:
-        print(f"Error resetting GPU: {e}")
-
-def handle_cuda_error(e):
-    if "CUDA error: device-side assert triggered" in str(e):
-        print(f"CUDA error caught: {e}")
-        torch.cuda.empty_cache()  # Clear the CUDA cache
-        reset_gpu()  # Reset GPU to recover
-    else:
-        raise e  # Reraise the exception if it's not the one we want to catch
 
 def random_rotate_points(points):
     # Random rotation around z-axis
@@ -123,46 +107,6 @@ class PointCloudChunkedDataset(Dataset):
 
         # print(idx, x.shape, y.shape, "\r")
         self.pbar.update(1)
-
-        return Data(x=x, y=y)
-
-class PointCloudDataset(Dataset):
-    def __init__(self, las_files, n_points=2000, transform=None, pre_transform=None):
-        super().__init__(None, transform, pre_transform)
-        self.las_files = las_files
-        self.n_points = n_points
-
-    def len(self):
-        return len(self.las_files)
-
-    def get(self, idx):
-        # Load LAS file
-        las = laspy.read(self.las_files[idx])
-        
-        # Extract features (modify based on available attributes)
-        feature_list = []
-        feature_list.append(np.column_stack((las.x, las.y, las.z)))             # xyz
-        # feature_list.append(np.array(las.intensity, dtype=np.float32))        # intensity
-        # feature_list.append(np.array(las.return_number, dtype=np.float32))    # return_number
-
-        features = np.column_stack([feature for feature in feature_list])
-        
-        # Extract labels (classification field)
-        labels = np.array(las.classification, dtype=np.int64)
-        
-        valid_labels = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15, 16])
-        mapped_labels = np.arange(len(valid_labels))
-        label_mapping = {old: new for old, new in zip(valid_labels, mapped_labels)}
-
-        # Randomly sample n points
-        indices = random.sample(range(len(features)), min(self.n_points, len(features)))
-        # x = torch.tensor(features[indices], dtype=torch.float)
-        # y = torch.tensor(labels[indices], dtype=torch.long)
-        x = torch.tensor(features[0:self.n_points], dtype=torch.float)
-        # y = torch.tensor(labels[0:self.n_points], dtype=torch.long)
-        y = torch.tensor([label_mapping[label] for label in labels if label in label_mapping], dtype=torch.long)
-
-        print(f"x shape: {x.shape}, y shape: {y.shape}")
 
         return Data(x=x, y=y)
 
@@ -595,14 +539,6 @@ def main():
     # Use the weights in loss function
     criterion = nn.CrossEntropyLoss(weight=class_weights)
 
-    """
-    percent = 0.1
-    chunk_abs_count = len(train_data)
-    chunk_eff_count = max(1, math.floor(percent * np.float64(chunk_abs_count)) )
-    print(f"chunk_abs_count: {chunk_abs_count}")
-    print(f"chunk_eff_count: {chunk_eff_count}")
-    """
-
     # Add memory status printing
     def print_memory_status():
         if torch.cuda.is_available():
@@ -783,16 +719,6 @@ def main():
     }, os.path.join(folder_dir, f"{model_type}_classifier.pth"))
     print("Model saved successfully!")
 
-    """
-    model = load_model("output/models/models_new/mlp_classifier.pth", in_channels=5, out_channels=TARGET_CLASSES, device=device)
-    las_file = "/workspace/data/general/pc2011/pc2011_11245000_RANDOM_SUBSAMPLED_2025-02-10_23h17_29_325.las"
-    new_labels = classify_point_cloud(model, las_file, device, 10000000)
-    # Print results
-    print(f"Classified {len(new_labels)} points from {las_file}")
-    output_file = "/workspace/reclassified.las"
-    save_reclassified_las(las_file, 10000000, new_labels, output_file)
-    """
-
     all_preds = []
     all_labels = []
     with torch.no_grad():
@@ -825,10 +751,14 @@ def main():
     for label, count in zip(unique_labels, counts):
         print(f"Class {label}: {count} samples ({count/len(labels)*100:.2f}%)")
 
+def handle_cuda_error(e):
+    print(f"CUDA error caught: {e}")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
 if __name__ == "__main__":
     
-    main()
-    
+    main()    
     # # model_path = "/workspace/output/2025-41-02/14/25-10-41_FILES_4_POINTS_2048_CHUNKS_20_EPOCHS_100/pointnet++_EPOCH_99_classifier.pth"
     # model_path = "/workspace/output/2025-02-14 11:05:12_FILES_4_POINTS_2048_CHUNKS_20_EPOCHS_100/pointnet++_EPOCH_99_classifier.pth"
     # # model_path = "/workspace/output/2025-02-14 11:34:15_FILES_5_POINTS_8192_CHUNKS_20_EPOCHS_100/pointnet++_EPOCH_99_classifier.pth"
