@@ -256,6 +256,67 @@ def save_as_las(points, labels, filename):
     # Save file
     las.write(filename)
 
+def create_spatial_chunks(points, labels, chunk_size=100000, overlap=0.1):
+    """
+    Split large point cloud into overlapping spatial chunks
+    
+    Args:
+        points: [N, 3] tensor of point coordinates
+        labels: [N] tensor of point labels
+        chunk_size: target number of points per spatial chunk
+        overlap: fraction of overlap between adjacent chunks
+    """
+    # Convert to numpy for easier spatial operations
+    points_np = points.numpy()
+    
+    # Calculate spatial extents
+    x_min, y_min, z_min = points_np.min(axis=0)
+    x_max, y_max, z_max = points_np.max(axis=0)
+    
+    # Calculate number of chunks in each dimension
+    total_points = len(points)
+    chunks_per_dim = int(np.ceil(np.cbrt(total_points / chunk_size)))
+    
+    # Calculate chunk sizes with overlap
+    x_chunk = (x_max - x_min) / chunks_per_dim
+    y_chunk = (y_max - y_min) / chunks_per_dim
+    z_chunk = (z_max - z_min) / chunks_per_dim
+    
+    overlap_x = x_chunk * overlap
+    overlap_y = y_chunk * overlap
+    overlap_z = z_chunk * overlap
+    
+    batched_data = []
+    
+    # Create overlapping spatial chunks
+    for i in range(chunks_per_dim):
+        x_start = x_min + i * x_chunk - (overlap_x if i > 0 else 0)
+        x_end = x_min + (i + 1) * x_chunk + (overlap_x if i < chunks_per_dim-1 else 0)
+        
+        for j in range(chunks_per_dim):
+            y_start = y_min + j * y_chunk - (overlap_y if j > 0 else 0)
+            y_end = y_min + (j + 1) * y_chunk + (overlap_y if j < chunks_per_dim-1 else 0)
+            
+            for k in range(chunks_per_dim):
+                z_start = z_min + k * z_chunk - (overlap_z if k > 0 else 0)
+                z_end = z_min + (k + 1) * z_chunk + (overlap_z if k < chunks_per_dim-1 else 0)
+                
+                # Get points in this chunk
+                mask = ((points_np[:, 0] >= x_start) & (points_np[:, 0] < x_end) &
+                       (points_np[:, 1] >= y_start) & (points_np[:, 1] < y_end) &
+                       (points_np[:, 2] >= z_start) & (points_np[:, 2] < z_end))
+                
+                if np.any(mask):
+                    chunk_points = points[mask]
+                    chunk_labels = labels[mask]
+                    
+                    # Create Data object for this chunk
+                    data = Data(x=chunk_points, y=chunk_labels)
+                    data.batch = torch.zeros(len(chunk_points), dtype=torch.long)
+                    batched_data.append(data)
+    
+    return batched_data
+
 def run_experiment(distribution_type):
     """Run the complete experiment for a given distribution type"""
     # Generate data
@@ -263,29 +324,16 @@ def run_experiment(distribution_type):
     val_points, val_labels = generate_synthetic_cloud_with_distribution(num_points=1000, distribution_type=distribution_type)
     test_points, test_labels = generate_synthetic_cloud_with_distribution(num_points=1000, distribution_type=distribution_type)
     
-    # Save point clouds as LAS files
-    save_as_las(train_points.numpy(), train_labels.numpy(), 
-                f'data/{distribution_type}/train.las')
-    save_as_las(val_points.numpy(), val_labels.numpy(), 
-                f'data/{distribution_type}/val.las')
-    save_as_las(test_points.numpy(), test_labels.numpy(), 
-                f'data/{distribution_type}/test.las')
-    
-    # Create data objects
-    train_data = Data(x=train_points, y=train_labels)
-    val_data = Data(x=val_points, y=val_labels)
-    test_data = Data(x=test_points, y=test_labels)
-    
-    # Add batch information
-    train_data.batch = torch.zeros(train_points.size(0), dtype=torch.long)
-    val_data.batch = torch.zeros(val_points.size(0), dtype=torch.long)
-    test_data.batch = torch.zeros(test_points.size(0), dtype=torch.long)
+    # Create spatial chunks
+    train_chunks = create_spatial_chunks(train_points, train_labels, chunk_size=1000)
+    val_chunks = create_spatial_chunks(val_points, val_labels, chunk_size=1000)
+    test_chunks = create_spatial_chunks(test_points, test_labels, chunk_size=1000)
     
     # Create data loaders
-    train_loader = DataLoader([train_data], batch_size=1)
-    val_loader = DataLoader([val_data], batch_size=1)
-    test_loader = DataLoader([test_data], batch_size=1)
-
+    train_loader = DataLoader(train_chunks, batch_size=2) # , shuffle=True)
+    val_loader = DataLoader(val_chunks, batch_size=2)
+    test_loader = DataLoader(test_chunks, batch_size=2)
+    
     # Setup model and training
     model = SimplePointNet()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
