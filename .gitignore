@@ -185,3 +185,4 @@ cython_debug/
 
 /*.las
 /*.png
+/img
