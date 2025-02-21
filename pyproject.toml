@@ -1,0 +1,43 @@
+[project]
+name = "als_classification"
+version = "0.1.0"
+authors = [
+    { name = "Cyrill Milkau", email = "cyrill.milkau@htw-dresden.de" },
+]
+description = "ALS point cloud classification scripts using deep learning"
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+dependencies = [
+    "torch>=2.0.0",
+    "numpy>=1.21.0",
+    "laspy>=2.0.0",
+    "scikit-learn>=1.0.0",
+    "tqdm>=4.65.0",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/yourusername/als_classification"
+"Bug Tracker" = "https://github.com/yourusername/als_classification/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["als_classification"] 
+
+[tool.als_classification.docker]
+required = true
+image = "nvcr.io/nvidia/pyg:24.07-py3"
+gpu_required = true
+
+[tool.als_classification.environment]
+cuda_required = true
+min_gpu_memory = "8 GB"
+recommended_gpu = "NVIDIA A2000 or better"
