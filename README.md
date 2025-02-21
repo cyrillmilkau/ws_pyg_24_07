@@ -28,3 +28,43 @@ This repository contains three iterations of ALS (Airborne Laser Scanning) point
   - Configurable class mapping
   - Chunk-based processing for large point clouds
   - Memory-efficient implementation
+
+## Usage
+
+### 0. Clone Repository
+
+```
+git clone https://kis5.geoinformation.htw-dresden.de/gitlab/blika389/als_classification.git
+```
+
+### 1. Download Docker
+
+https://www.docker.com/products/docker-desktop/
+
+### 2. Run PyG Docker Container
+
+https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pyg e.g. 
+
+```
+docker run --gpus all -it -v D:/src/als_classification:/workspace nvcr.io/nvidia/pyg:24.07-py3
+```
+
+### 3. Install package and run
+
+```
+pip install -e .
+```
+or
+```
+pip install -e .[dev]
+```
+
+then run via
+
+```
+python -m als_classification.als_classification
+```
+
+### IV (Optional:) Attach via VS Code
+
+https://code.visualstudio.com/docs/devcontainers/attach-container
