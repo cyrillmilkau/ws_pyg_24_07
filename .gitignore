@@ -173,16 +173,21 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
-# any data
+# any (input) data
 /data
 
-# output models
-/output/models
+# any (output) data 
 /output
+/log
 
-# tr3d reference
+# any tr3d reference
 /tr3d
 
+# any large file
 /*.las
 /*.png
 /img
+
+# any model
+/models
+*.pt
